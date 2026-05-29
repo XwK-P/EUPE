@@ -1,0 +1,7 @@
+# EUPE ConvNeXt-Tiny student (29M). Matches eupe/models/convnext.py::convnext_sizes["tiny"].
+student:
+  arch: convnext_tiny
+  depths: [3, 3, 9, 3]
+  dims: [96, 192, 384, 768]
+  drop_path_rate: 0.0
+  layer_scale_init_value: 1.0e-06

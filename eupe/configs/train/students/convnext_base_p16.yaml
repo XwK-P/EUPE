@@ -1,0 +1,7 @@
+# EUPE ConvNeXt-Base student (89M).
+student:
+  arch: convnext_base
+  depths: [3, 3, 27, 3]
+  dims: [128, 256, 512, 1024]
+  drop_path_rate: 0.0
+  layer_scale_init_value: 1.0e-06
