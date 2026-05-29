@@ -32,9 +32,22 @@ class CosineScheduler:
         start_warmup_value: float = 0.0,
         freeze_iters: int = 0,
     ):
-        # TODO: precompute self.schedule as a numpy array of length total_iters
-        # (freeze -> linear warmup -> cosine decay). See dinov3/train/cosine_lr_scheduler.py.
-        raise NotImplementedError("TODO: precompute freeze+warmup+cosine schedule array")
+        # Ported from refs/dinov3/dinov3/train/cosine_lr_scheduler.py:CosineScheduler.__init__
+        # — dropped the trunc_extra branch (not in frozen interface); schedule is
+        #   freeze (start_warmup_value) -> linear warmup -> cosine decay, concatenated to total_iters.
+        self.final_value = np.float64(final_value)
+        self.total_iters = total_iters
+
+        freeze_schedule = np.full((freeze_iters,), start_warmup_value, dtype=np.float64)
+
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+
+        iters = np.arange(total_iters - warmup_iters - freeze_iters)
+        cosine_schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+
+        self.schedule = np.concatenate((freeze_schedule, warmup_schedule, cosine_schedule), dtype=np.float64)
+
+        assert len(self.schedule) == self.total_iters
 
     def __getitem__(self, it: int) -> float:
-        raise NotImplementedError("TODO: return self.schedule[min(it, len-1)]")
+        return self.schedule[min(it, len(self.schedule) - 1)]
