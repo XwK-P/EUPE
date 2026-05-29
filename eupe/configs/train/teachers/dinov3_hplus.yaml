@@ -1,0 +1,6 @@
+# DINOv3-H+ teacher (dense prediction). Load via dinov3 hub / checkpoint.
+name: dinov3_hplus
+loader: DINOv3Teacher
+checkpoint: <PATH/TO/dinov3_hplus.pth>   # facebookresearch/dinov3
+native_resolution: 256
+embed_dim: 1280

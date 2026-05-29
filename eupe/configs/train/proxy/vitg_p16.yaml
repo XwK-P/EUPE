@@ -1,0 +1,15 @@
+# ViT-G proxy (~1.9B). Stage-1 student; Stage-2/3 teacher. Tune ffn/depth toward ~1.9B params.
+student:
+  arch: vit_giant2          # embed_dim 1536, depth 40, num_heads 24 (eupe/models/vision_transformer.py)
+  patch_size: 16
+  n_storage_tokens: 4       # 4 register tokens (paper §4.1)
+  layerscale: 1.0e-05
+  norm_layer: layernormbf16
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  mask_k_bias: true
+  pos_embed_type: rope
+  pos_embed_rope_base: 100
+  pos_embed_rope_normalize_coords: separate
+  pos_embed_rope_rescale_coords: 2
+  pos_embed_rope_dtype: fp32

@@ -1,0 +1,6 @@
+# PEcore-G teacher (image understanding / zero-shot). Load via perception_models.
+name: pecore_g
+loader: PECoreTeacher
+checkpoint: <PATH/TO/PEcore-G.pt>   # facebookresearch/perception_models
+native_resolution: 448
+embed_dim: 1536
