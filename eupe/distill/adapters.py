@@ -26,13 +26,19 @@ class AdapterHead(nn.Module):
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
         super().__init__()
-        # TODO: build fc1=Linear(in_dim,hidden_dim,bias=False), norm=LayerNorm(hidden_dim),
-        # act=GELU, fc2=Linear(hidden_dim,out_dim,bias=False). See paper §4.1 / RADIO adaptor_mlp.MLP2.
-        raise NotImplementedError("TODO: construct the 2-layer adapter MLP (paper §4.1)")
+        # Ported from refs/RADIO/radio/adaptor_mlp.py:MLP2 (num_inner=0) - biases removed per paper §4.1
+        # MLP2 structure is fc1 -> (LayerNorm, GELU, Linear). With num_inner=0 the residual blocks
+        # vanish, collapsing to fc1 -> norm -> act -> fc2; all Linear biases dropped (paper §4.1).
+        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         """Map x[..., in_dim] -> [..., out_dim]. Works for cls [B,d] and patch [B,N,d]."""
-        raise NotImplementedError("TODO: fc1 -> norm -> gelu -> fc2")
+        # LayerNorm/GELU/Linear all act on the trailing feature dim, so leading dims
+        # (the optional token axis) broadcast for free.
+        return self.fc2(self.act(self.norm(self.fc1(x))))
 
 
 class AdapterHeadSet(nn.Module):
@@ -46,9 +52,25 @@ class AdapterHeadSet(nn.Module):
 
     def __init__(self, student_dim: int, teacher_specs: Sequence[Tuple[str, int]], hidden_dim: int):
         super().__init__()
-        # TODO: nn.ModuleDict mapping name -> ModuleDict({"cls": AdapterHead, "patch": AdapterHead}).
-        raise NotImplementedError("TODO: build per-teacher cls/patch adapter heads")
+        # One independent (cls, patch) adapter pair per teacher; student_dim -> hidden_dim -> teacher_dim.
+        self.heads = nn.ModuleDict(
+            {
+                name: nn.ModuleDict(
+                    {
+                        "cls": AdapterHead(student_dim, hidden_dim, teacher_dim),
+                        "patch": AdapterHead(student_dim, hidden_dim, teacher_dim),
+                    }
+                )
+                for name, teacher_dim in teacher_specs
+            }
+        )
 
     def forward(self, student_cls: Tensor, student_patch: Tensor) -> Dict[str, Dict[str, Tensor]]:
         """Return {teacher_name: {"cls": z_cls[B,d_T], "patch": z_patch[B,N_S,d_T]}}."""
-        raise NotImplementedError("TODO: apply each teacher's cls/patch heads to the student tokens")
+        return {
+            name: {
+                "cls": head["cls"](student_cls),
+                "patch": head["patch"](student_patch),
+            }
+            for name, head in self.heads.items()
+        }
