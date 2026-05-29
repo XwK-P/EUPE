@@ -1,0 +1,40 @@
+# Stage 3: proxy -> family, multi-resolution pyramid {256,384,512}, short schedule.
+# Students init from Stage-2 checkpoints (set student.pretrained_weights per student config).
+MODEL:
+  META_ARCHITECTURE: MultiDistillationMetaArch
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+multidistillation:
+  enabled: true
+  global_batch_size: 4096
+  students:
+    - {name: vitt,           config_path: eupe/configs/train/students/vitt_p16.yaml,           ranks_range: [0, 16]}
+    - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 40]}
+    - {name: vitb,           config_path: eupe/configs/train/students/vitb_p16.yaml,           ranks_range: [40, 88]}
+    - {name: convnext_tiny,  config_path: eupe/configs/train/students/convnext_tiny_p16.yaml,  ranks_range: [88, 104]}
+    - {name: convnext_small, config_path: eupe/configs/train/students/convnext_small_p16.yaml, ranks_range: [104, 128]}
+    - {name: convnext_base,  config_path: eupe/configs/train/students/convnext_base_p16.yaml,  ranks_range: [128, 168]}
+distill:
+  teachers:
+    - {name: proxy, config: eupe/configs/train/proxy/vitg_p16.yaml, checkpoint: <STAGE1_PROXY_CKPT.pth>}
+  adapter_hidden_dim: 3072
+  normalizer_warmup_iters: 500
+  loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+crops:
+  global_crops_size: [256, 384, 512]  # pyramid; teacher & student sample independently
+  teacher_to_student_resolution_scale: 1.0
+optim:
+  optimizer: adamw
+  weight_decay: 1.0e-04
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+schedules:
+  lr: {start: 0.0, peak: 1.0e-05, end: 0.0, warmup_epochs: 0, cosine: true}
+train:
+  dataset_path: <LVD1689M+IN1k>
+  OFFICIAL_EPOCH_LENGTH: 1250         # 100000 iters total -> set optim.epochs = 80
+  compile: true
+  checkpointing: true
+optim_total_iters: 100000

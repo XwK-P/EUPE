@@ -1,0 +1,32 @@
+# Stage 1: {PEcore-G, PElang-G, DINOv3-H+} -> ViT-G proxy. Single student (the proxy).
+MODEL:
+  META_ARCHITECTURE: DistillationMetaArch
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP   # use FULL_SHARD if memory-bound on the 1.9B proxy
+distill:
+  teachers:
+    - {name: pecore_g,     config: teachers/pecore_g.yaml}
+    - {name: pelang_g,     config: teachers/pelang_g.yaml}
+    - {name: dinov3_hplus, config: teachers/dinov3_hplus.yaml}
+  adapter_hidden_dim: 1536
+  normalizer_warmup_iters: 500
+  loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+student:                              # see proxy/vitg_p16.yaml; merge it in via opts at launch
+  arch: vit_giant2
+  patch_size: 16
+  n_storage_tokens: 4
+crops:
+  global_crops_size: 256
+optim:
+  optimizer: adamw
+  scaling_rule: sqrt_wrt_1024
+  clip_grad: 3.0
+  weight_decay: 0.04
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+train:
+  dataset_path: <LVD1689M+IN1k>       # see eupe/data/distillation_loaders.py
+  compile: true
+  checkpointing: true
