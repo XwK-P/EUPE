@@ -242,6 +242,23 @@ def _save_checkpoint(cfg, model, optimizer, iteration: int) -> None:
     logger.info("Saved checkpoint: %s", ckpt_path)
 
 
+def _clip_gradients(model, max_norm: float) -> None:
+    """Clip grads of the (FSDP-sharded) student and the (non-FSDP) adapter heads.
+
+    FSDP1 wraps the student and exposes a ``clip_grad_norm_`` that reduces the *global* sharded
+    norm; a plain ``nn.Module`` (single-process fallback) has no such method, so the free clip is
+    used there. The adapter heads live outside the FSDP unit and are always clipped with the free clip.
+    """
+    student = model.student
+    if hasattr(student, "clip_grad_norm_"):
+        student.clip_grad_norm_(max_norm)  # FSDP-aware global-norm clip
+    else:
+        torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm)
+    adapter_grads = [p for p in model.adapters.parameters() if p.grad is not None]
+    if adapter_grads:
+        torch.nn.utils.clip_grad_norm_(adapter_grads, max_norm)
+
+
 def do_train(cfg, model) -> None:
     """Main loop: init_normalizer -> for it in range(max_iter): forward_backward; schedule; checkpoint."""
     # Ported from refs/dinov3/dinov3/train/train.py:do_train — divergence: no DINO/iBOT/Gram/EMA
@@ -262,6 +279,17 @@ def do_train(cfg, model) -> None:
         patch_embed_lr_mult=float(cfg.optim.get("patch_embed_lr_mult", 0.2)),
     )
     param_groups = fuse_params_groups(param_groups)
+    # Adapter heads are trained JOINTLY with the student (paper §4.1) and live OUTSIDE the FSDP
+    # student module, so add them as their own AdamW groups at base LR (no layer-wise decay): a
+    # weight-decay group for matrices (ndim>=2) and a no-WD group for norms/biases (ndim<=1).
+    adapter_decay = [p for p in model.adapters.parameters() if p.requires_grad and p.ndim > 1]
+    adapter_no_decay = [p for p in model.adapters.parameters() if p.requires_grad and p.ndim <= 1]
+    if adapter_decay:
+        param_groups.append({"params": adapter_decay, "lr": float(base_lr),
+                             "weight_decay": base_wd, "lr_mult": 1.0, "wd": base_wd})
+    if adapter_no_decay:
+        param_groups.append({"params": adapter_no_decay, "lr": float(base_lr),
+                             "weight_decay": 0.0, "lr_mult": 1.0, "wd": 0.0})
     optimizer = build_optimizer(cfg, param_groups)
     schedulers = build_schedulers(cfg)
 
@@ -298,9 +326,14 @@ def do_train(cfg, model) -> None:
         # Learning-rate / weight-decay schedule for this step.
         apply_optim_scheduler(optimizer, schedulers, iteration)
 
-        # Forward + backward. backprop_loss() runs loss.backward() and the cfg.optim.clip_grad clip.
+        # Forward + backward (backprop_loss runs an unscaled loss.backward()).
         optimizer.zero_grad(set_to_none=True)
         loss_dict = model.forward_backward(data, iteration=iteration)
+        # Grad clip in the loop (matches dinov3) so it spans the FSDP-sharded student AND the
+        # separately-held adapter heads with the correct global norm.
+        clip_grad = cfg.optim.get("clip_grad", None)
+        if clip_grad:
+            _clip_gradients(model, float(clip_grad))
         optimizer.step()
 
         if (iteration + 1) % 50 == 0:
@@ -371,19 +404,30 @@ def main(args=None) -> int:
             cfg = setup_config(setup_args, strict_cfg=False)
         logger.info("Making meta arch %s", meta_arch_cls.__name__)
 
-        # Build on the meta device (matches dinov3) so FSDP can shard before materializing weights.
-        with torch.device("meta"):
-            model = meta_arch_cls(cfg)
+        # Build the meta-arch. The student backbone is built on the META device by
+        # build_model_from_cfg (so the ~1.9B proxy never materializes unsharded); the FROZEN teachers
+        # are loaded eagerly with their real checkpoints onto cuda (build_teachers), and the adapter
+        # heads / normalizers are built on the default device. We deliberately do NOT wrap this in
+        # `torch.device("meta")`: doing so would also put the teachers + adapters on meta, breaking the
+        # teacher checkpoint load — and the old blanket model.to_empty() would then zero their weights.
+        model = meta_arch_cls(cfg)
 
-        # FSDP-wrap the student backbone (teachers stay frozen/eval inside the meta-arch).
+        # FSDP-wrap ONLY the student backbone (teachers stay frozen/eval inside the meta-arch).
         model.student = parallelize(model.student, cfg)
 
-        # Materialize any remaining meta tensors and initialize the student weights.
-        if any(p.is_meta for p in model.parameters()):
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model.to_empty(device=device)
+        # Materialize + initialize the student if it is still on meta (e.g. the single-process
+        # fallback where parallelize skipped FSDP). We never to_empty the WHOLE model — that would
+        # wipe the teachers' loaded checkpoints and the adapter init.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if any(p.is_meta for p in model.student.parameters()):
+            model.student.to_empty(device=device)
         if hasattr(model.student, "init_weights"):
-            model.student.init_weights()
+            model.student.init_weights()  # NOTE: FSDP1 meta-init path — validate on GPU.
+        # Place the trainable adapters + frozen normalizer buffers on the compute device (the teachers
+        # were already moved to cuda by build_teachers).
+        if torch.cuda.is_available():
+            model.adapters.cuda()
+            model.normalizers.cuda()
 
         do_train(cfg, model)
     return 0

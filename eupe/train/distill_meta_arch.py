@@ -143,15 +143,14 @@ class DistillationMetaArch(nn.Module):
         return self.loss(adapted_student, teacher_normalized)
 
     def backprop_loss(self, loss: Tensor) -> None:
-        """Backward with the configured grad scaler / fp32 reduce. See dinov3 ssl_meta_arch."""
+        """Plain (unscaled) backward; grad clipping is owned by the train loop. See dinov3."""
         # Ported from refs/dinov3/dinov3/train/ssl_meta_arch.py:backprop_loss — divergence: bf16
-        # autocast/FSDP keep the backward unscaled (no GradScaler), so this is a plain backward()
-        # followed by the cfg.optim.clip_grad clip (dinov3 does the clip in the train loop; we fold
-        # it in here since the distillation loop calls backprop_loss directly).
+        # autocast/FSDP keep the backward unscaled (no GradScaler), so this is a plain backward().
+        # The cfg.optim.clip_grad clip is applied in eupe/train/train.py::do_train (matching dinov3,
+        # which clips in the loop) so it can use the FSDP-aware global-norm clip over the sharded
+        # student AND the (non-FSDP) adapter heads — clipping only self.student here would both miss
+        # the adapters and compute the wrong global norm under FSDP1.
         loss.backward()
-        clip_grad = self.cfg.optim.get("clip_grad", None)
-        if clip_grad:
-            torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=clip_grad)
 
     def forward_backward(self, data, *, iteration: int = 0, **ignored) -> Dict[str, Tensor]:
         """One train step: student forward -> compute_losses -> backprop_loss; return log dict."""
