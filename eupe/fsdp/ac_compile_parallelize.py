@@ -3,11 +3,18 @@
 # This software may be used and distributed in accordance with
 # the terms of the FAIR Noncommercial Research License.
 
-"""FSDP sharding + activation checkpointing + torch.compile (mirrors dinov3/fsdp).
+"""FSDP2 sharding + activation checkpointing + torch.compile (mirrors dinov3/fsdp).
 
 Reads cfg.compute_precision (param_dtype=bf16, reduce_dtype=fp32, sharding_strategy=SHARD_GRAD_OP)
-and cfg.train.{checkpointing, checkpointing_full, compile}. Use FULL_SHARD for the 1.9B/7B proxy
-if memory-bound.
+and cfg.train.{checkpointing, checkpointing_full, compile}.
+
+Aligned to dinov3's FSDP2 path (``torch.distributed._composable.fsdp.fully_shard``): each transformer
+block (or ConvNeXt block-within-stage / downsample unit) is sharded independently with forward /
+backward prefetch, the whole backbone is sharded last, and meta-device init is materialized via
+``to_empty`` so the caller's ``init_weights()`` can fill each local shard. The legacy
+``cfg.compute_precision.sharding_strategy`` enum name is mapped onto fully_shard's
+``reshard_after_forward`` (FULL_SHARD -> True / SHARD_GRAD_OP -> False). FSDP2's MixedPrecisionPolicy
+casts params/grads only — buffers (e.g. the fp32 RoPE periods) are left untouched, matching dinov3.
 """
 import logging
 from functools import partial
@@ -16,7 +23,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from eupe.layers.block import SelfAttentionBlock
+from eupe.layers.block import SelfAttentionBlock  # noqa: F401  (documents the ViT block unit)
 
 logger = logging.getLogger("eupe")
 
@@ -27,25 +34,8 @@ _DTYPE_MAP = {
     "fp32": torch.float32,
 }
 
-
-def _iter_transformer_blocks(model: nn.Module):
-    """Yield (parent_list, index) for every transformer block in a ViT-style backbone."""
-    blocks = getattr(model, "blocks", None)
-    if isinstance(blocks, nn.ModuleList):
-        for block_id in range(len(blocks)):
-            yield blocks, block_id
-
-
-def _iter_convnext_units(model: nn.Module):
-    """Yield (parent_list, index) for ConvNeXt stages + downsample layers."""
-    stages = getattr(model, "stages", None)
-    downsample_layers = getattr(model, "downsample_layers", None)
-    if isinstance(stages, nn.ModuleList):
-        for stage_id in range(len(stages)):
-            yield stages, stage_id
-    if isinstance(downsample_layers, nn.ModuleList):
-        for dsl_id in range(len(downsample_layers)):
-            yield downsample_layers, dsl_id
+# FULL_SHARD (ZeRO-3) reshards params after forward; SHARD_GRAD_OP (ZeRO-2) keeps them gathered.
+_RESHARD_AFTER_FORWARD = {"FULL_SHARD": True, "SHARD_GRAD_OP": False, "NO_SHARD": False}
 
 
 def _is_convnext(model: nn.Module) -> bool:
@@ -54,75 +44,118 @@ def _is_convnext(model: nn.Module) -> bool:
     )
 
 
-def apply_activation_checkpointing(model: nn.Module, full: bool = False) -> nn.Module:
-    """Wrap transformer blocks (or everything, if full) with activation checkpointing."""
-    # Ported from refs/dinov3/dinov3/fsdp/ac_compile_parallelize.py:
-    # activation_checkpoint_transformer / activation_checkpoint_convnext / get_activation_checkpoint_wrapper
-    # — divergence: collapsed into one fn taking a bare backbone with a `full` flag (no cfg object,
-    #   FSDP1 instead of FSDP2), and selective-vs-full policy chosen by `full`.
+def _get_activation_checkpoint_wrapper(full: bool):
+    # Ported from refs/dinov3/dinov3/fsdp/ac_compile_parallelize.py:get_activation_checkpoint_wrapper
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
     from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
     if full:
-        _checkpointing_wrapper = checkpoint_wrapper
         logger.info("activation checkpointing: full policy")
-    else:
-        _save_list = [
-            # mm
-            torch.ops.aten.mm.default,
-            torch.ops.aten._scaled_mm.default,
-            # attentions
-            torch.ops.aten._scaled_dot_product_efficient_attention.default,
-            torch.ops.aten._scaled_dot_product_flash_attention.default,
-            torch.ops._c10d_functional.reduce_scatter_tensor.default,
-        ]
-        _checkpointing_wrapper = partial(
-            checkpoint_wrapper,
-            context_fn=partial(create_selective_checkpoint_contexts, _save_list),
-            preserve_rng_state=True,
-        )
-        logger.info("activation checkpointing: selective policy")
+        return checkpoint_wrapper
+    _save_list = [
+        # mm
+        torch.ops.aten.mm.default,
+        torch.ops.aten._scaled_mm.default,
+        # attentions
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    ]
+    logger.info("activation checkpointing: selective policy")
+    return partial(
+        checkpoint_wrapper,
+        context_fn=partial(create_selective_checkpoint_contexts, _save_list),
+        preserve_rng_state=True,
+    )
 
+
+def apply_activation_checkpointing(model: nn.Module, full: bool = False) -> nn.Module:
+    """Wrap each transformer block (ViT) or each block-within-stage + downsample unit (ConvNeXt)."""
+    # Ported from refs/dinov3/.../ac_compile_parallelize.py:activation_checkpoint_{transformer,convnext}
+    # — per-block granularity (ConvNeXt wraps inside each stage, matching dinov3, not whole stages).
+    wrapper = _get_activation_checkpoint_wrapper(full)
     if _is_convnext(model):
-        for parent, idx in _iter_convnext_units(model):
-            parent[idx] = _checkpointing_wrapper(parent[idx])
+        for stage_id, stage in enumerate(model.stages):
+            for block_id, block in enumerate(stage):
+                model.stages[stage_id][block_id] = wrapper(block)
+        for dsl_id, dsl in enumerate(model.downsample_layers):
+            model.downsample_layers[dsl_id] = wrapper(dsl)
     else:
-        for parent, idx in _iter_transformer_blocks(model):
-            parent[idx] = _checkpointing_wrapper(parent[idx])
+        for block_id, block in enumerate(model.blocks):
+            model.blocks[block_id] = wrapper(block)
     return model
+
+
+def _compile_unit(module: nn.Module) -> nn.Module:
+    module.compile()
+    return module
 
 
 def apply_compile(model: nn.Module) -> nn.Module:
-    """torch.compile the per-block forward. See dinov3 ac_compile_parallelize."""
-    # Ported from refs/dinov3/dinov3/fsdp/ac_compile_parallelize.py:
-    # compile_transformer / compile_convnext / wrap_compile_block
-    # — divergence: bare backbone (no cfg/cudagraphs); compile each block/stage in-place with the
-    #   default backend so dynamo can reuse the per-block graph across the ModuleList.
+    """torch.compile each transformer block (ViT) or each stage + downsample unit (ConvNeXt)."""
+    # Ported from refs/dinov3/.../ac_compile_parallelize.py:compile_{transformer,convnext} — compile
+    # the per-block (ViT) / per-stage (ConvNeXt) forward in place so dynamo reuses the graph.
     if _is_convnext(model):
-        for parent, idx in _iter_convnext_units(model):
-            parent[idx].compile()
+        for stage_id, stage in enumerate(model.stages):
+            model.stages[stage_id] = _compile_unit(stage)
+        for dsl_id, dsl in enumerate(model.downsample_layers):
+            model.downsample_layers[dsl_id] = _compile_unit(dsl)
     else:
-        for parent, idx in _iter_transformer_blocks(model):
-            parent[idx].compile()
+        for block_id, block in enumerate(model.blocks):
+            model.blocks[block_id] = _compile_unit(block)
     return model
 
 
+def _fully_shard_transformer(model: nn.Module, fsdp_config: dict, reshard_after_forward) -> None:
+    # Ported from refs/dinov3/.../ac_compile_parallelize.py:fsdp_transformer — shard every block, set
+    # adjacent-block forward/backward prefetch, then shard the whole backbone last.
+    from torch.distributed._composable.fsdp import fully_shard
+
+    blocks = model.blocks
+    for block_id, block in enumerate(blocks):
+        blocks[block_id] = fully_shard(block, reshard_after_forward=reshard_after_forward, **fsdp_config)
+    for prev_block, next_block in zip(blocks, blocks[1:]):
+        prev_block.set_modules_to_forward_prefetch([next_block])
+        next_block.set_modules_to_backward_prefetch([prev_block])
+    fully_shard(model, reshard_after_forward=True, **fsdp_config)
+
+
+def _fully_shard_convnext(model: nn.Module, fsdp_config: dict, reshard_after_forward) -> None:
+    # Ported from refs/dinov3/.../ac_compile_parallelize.py:fsdp_convnext — shard each stage + each
+    # downsample layer, cross-prefetch downsample<->stage, then shard the whole backbone last.
+    from torch.distributed._composable.fsdp import fully_shard
+
+    stages = model.stages
+    for stage_id, stage in enumerate(stages):
+        stages[stage_id] = fully_shard(stage, reshard_after_forward=reshard_after_forward, **fsdp_config)
+    downsample_layers = model.downsample_layers
+    for dsl_id, dsl in enumerate(downsample_layers):
+        downsample_layers[dsl_id] = fully_shard(
+            dsl, reshard_after_forward=reshard_after_forward, **fsdp_config
+        )
+    for dsl, stage in zip(downsample_layers, stages):
+        dsl.set_modules_to_forward_prefetch([stage])
+        stage.set_modules_to_backward_prefetch([dsl])
+    fully_shard(model, reshard_after_forward=True, **fsdp_config)
+
+
 def parallelize(model: nn.Module, cfg) -> nn.Module:
-    """FSDP-wrap per cfg.compute_precision, optionally activation-ckpt + compile; return wrapped model.
+    """FSDP2-shard the backbone per cfg.compute_precision, optionally AC + compile; return it.
 
-    Build a MixedPrecision policy from param_dtype/reduce_dtype; choose ShardingStrategy from
-    cfg.compute_precision.sharding_strategy; init on meta device then to_empty/cuda.
+    Mirrors dinov3 ``ac_compile_parallelize``: 1/ activation checkpointing, 2/ compile, 3/ per-block
+    ``fully_shard`` (+ prefetch) then whole-backbone ``fully_shard``, 4/ ``to_empty`` to materialize
+    the sharded meta params on cuda. The caller (train.py) then runs ``init_weights()`` to fill each
+    local shard. The non-default training entry point (``forward_features``) is registered with FSDP2
+    so its params are all-gathered/resharded around the forward.
     """
-    # Ported from refs/dinov3/dinov3/fsdp/ac_compile_parallelize.py:ac_compile_parallelize
-    # — divergence: dinov3 uses FSDP2 (fully_shard) on a backbone ModuleDict; here we use the FSDP1
-    #   FullyShardedDataParallel wrapper because EUPE's cfg.compute_precision.sharding_strategy names
-    #   a ShardingStrategy enum (SHARD_GRAD_OP/FULL_SHARD) and the entry point hands us a bare backbone.
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+    # — divergence from the prior FSDP1 port: this now uses FSDP2 fully_shard (DTensor sharding),
+    #   which is the meta-init path dinov3 uses; cfg.compute_precision.sharding_strategy is mapped to
+    #   reshard_after_forward rather than a ShardingStrategy enum.
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import register_fsdp_forward_method
 
-    logger.info("DISTRIBUTED FSDP -- preparing model for distributed training")
+    logger.info("DISTRIBUTED FSDP2 -- preparing model for distributed training")
 
     # Order matches dinov3: 1/ activation checkpointing, 2/ compile, 3/ FSDP.
     if getattr(cfg.train, "checkpointing", False):
@@ -130,55 +163,39 @@ def parallelize(model: nn.Module, cfg) -> nn.Module:
     if getattr(cfg.train, "compile", False):
         apply_compile(model)
 
-    # 1/ MixedPrecision policy from cfg.compute_precision.{param_dtype, reduce_dtype}.
-    mp_policy = MixedPrecision(
+    # MixedPrecisionPolicy casts params/grads only; buffers (fp32 RoPE periods) are left as-is.
+    mp_policy = MixedPrecisionPolicy(
         param_dtype=_DTYPE_MAP[cfg.compute_precision.param_dtype],
         reduce_dtype=_DTYPE_MAP[cfg.compute_precision.reduce_dtype],
-        buffer_dtype=_DTYPE_MAP[cfg.compute_precision.param_dtype],
     )
-
-    # 2/ ShardingStrategy enum lookup by name (SHARD_GRAD_OP / FULL_SHARD / NO_SHARD / ...).
-    sharding_strategy = ShardingStrategy[cfg.compute_precision.sharding_strategy]
-
-    # 3/ Auto-wrap each transformer block (or ConvNeXt stage/downsample unit) as its own FSDP
-    #    instance, so each is sharded independently like dinov3's per-block fully_shard. Activation
-    #    checkpointing (if applied above) wraps the blocks in CheckpointWrapper, so include it in the
-    #    wrap policy too.
-    if _is_convnext(model):
-        # RECONSTRUCTED (unverified): ConvNeXt stage/downsample units are nn.Sequential, so wrap by
-        # the leaf module classes that compose them; fall back to wrapping every nn.Sequential unit.
-        wrap_classes = {nn.Sequential, CheckpointWrapper}
-    else:
-        wrap_classes = {SelfAttentionBlock, CheckpointWrapper}
-    auto_wrap_policy = ModuleWrapPolicy(wrap_classes)
-
-    # 4/ Meta-device init support: if the model was built on the meta device, FSDP needs a
-    #    param_init_fn to materialize each shard on cuda via to_empty before init_weights runs.
+    reshard_after_forward = _RESHARD_AFTER_FORWARD.get(cfg.compute_precision.sharding_strategy, True)
     on_meta = any(p.is_meta for p in model.parameters())
 
-    def _param_init_fn(module: nn.Module) -> None:
-        module.to_empty(device=torch.cuda.current_device(), recurse=False)
-
-    fsdp_kwargs = dict(
-        sharding_strategy=sharding_strategy,
-        mixed_precision=mp_policy,
-        auto_wrap_policy=auto_wrap_policy,
-        device_id=torch.cuda.current_device() if torch.cuda.is_available() else None,
-        use_orig_params=True,
-    )
-    if on_meta:
-        fsdp_kwargs["param_init_fn"] = _param_init_fn
-
-    if dist.is_available() and dist.is_initialized():
-        model = FSDP(model, **fsdp_kwargs)
-    else:
-        # RECONSTRUCTED (unverified): FSDP requires an initialized process group; if none is present
-        # (e.g. single-process smoke test), skip sharding and just move the model onto cuda so the
-        # rest of the pipeline still runs.
-        logger.warning("parallelize: no initialized process group -- skipping FSDP wrap")
+    if not (dist.is_available() and dist.is_initialized()):
+        # No process group (e.g. single-process smoke test): can't shard; materialize so the rest runs.
+        logger.warning("parallelize: no initialized process group -- skipping FSDP2 shard")
+        device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         if on_meta:
-            model.to_empty(device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+            model.to_empty(device=device)
         elif torch.cuda.is_available():
             model = model.cuda()
+        return model
 
+    mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
+    fsdp_config = {"mesh": mesh, "mp_policy": mp_policy}
+    if _is_convnext(model):
+        _fully_shard_convnext(model, fsdp_config, reshard_after_forward)
+    else:
+        _fully_shard_transformer(model, fsdp_config, reshard_after_forward)
+
+    # FSDP2 only hooks the module's `forward`; training calls student.forward_features(...), and eval
+    # uses get_intermediate_layers, so register both as managed forward methods (all-gather/reshard).
+    for method_name in ("forward_features", "get_intermediate_layers"):
+        if hasattr(model, method_name):
+            register_fsdp_forward_method(model, method_name)
+
+    # Meta-device init (dinov3 step 4): materialize the now-sharded params on cuda as empty storage;
+    # train.py then calls model.student.init_weights() to initialize each local shard.
+    if on_meta:
+        model.to_empty(device="cuda")
     return model
