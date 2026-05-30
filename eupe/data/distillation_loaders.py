@@ -157,36 +157,33 @@ class _MixedRoutingDataset(torch.utils.data.Dataset):
 
 
 def build_pyramid_collate(scales: List[int]):
-    """Return a collate_fn that resizes each sample to an independently sampled scale (Stage 3).
+    """Return a collate_fn that resizes the whole batch to ONE scale sampled per iteration (Stage 3).
 
-    Each sample in the batch independently draws a scale from `scales` (uniformly), is bicubic-
-    resized to a `(scale, scale)` square, then all samples are zero-padded (top-left aligned) to
-    the largest scale present in the batch and stacked into one `[B, C, S_max, S_max]` tensor.
-    Returns `(images, sources)` where `sources` is the per-sample source tag list.
+    Report §7.3: "teacher & student each pick one scale independently per step." So a single scale is
+    drawn per *batch* (not per sample); every image is bicubic-resized to `(scale, scale)` and the
+    batch is cleanly stacked into `[B, C, scale, scale]`. A per-sample scale would force padding to a
+    common size, which feeds black borders — and shifted RoPE positions — into the encoder. The
+    teacher samples its own scale independently via `crops.teacher_to_student_resolution_scale`.
+    Returns `(images, sources)`.
 
-    Stage 3 multi-resolution pyramid {256, 384, 512} (paper §3.4); per-sample independent draw.
+    Stage 3 multi-resolution pyramid {256, 384, 512} (paper §3.4).
     """
     scales = [int(s) for s in scales]
 
     def collate_fn(batch):
         # `batch` is a list of (image_tensor[C,H,W], source) produced by the transform pipeline.
         images, sources = zip(*batch)
-        chosen = [scales[torch.randint(len(scales), (1,)).item()] for _ in images]
+        scale = scales[torch.randint(len(scales), (1,)).item()]  # one scale per iteration (per step)
         resized = [
             v2.functional.resize(
                 img,
-                [s, s],
+                [scale, scale],
                 interpolation=v2.InterpolationMode.BICUBIC,
                 antialias=True,
             )
-            for img, s in zip(images, chosen)
+            for img in images
         ]
-        max_scale = max(chosen)
-        channels = resized[0].shape[0]
-        out = images[0].new_zeros((len(resized), channels, max_scale, max_scale))
-        for i, (img, s) in enumerate(zip(resized, chosen)):
-            out[i, :, :s, :s] = img
-        return out, list(sources)
+        return torch.stack(resized, dim=0), list(sources)
 
     return collate_fn
 
