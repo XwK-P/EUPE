@@ -22,6 +22,7 @@ distill:
   adapter_hidden_dim: 3072
   normalizer_warmup_iters: 500
   loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+  imagenet_prob: 0.10                  # P(homogeneous ImageNet-1k batch) vs LVD (paper §3.4)
 crops:
   global_crops_size: [256, 384, 512]  # pyramid; teacher & student sample independently
   teacher_to_student_resolution_scale: 1.0
@@ -33,7 +34,7 @@ optim:
 schedules:
   lr: {start: 0.0, peak: 1.0e-05, end: 0.0, warmup_epochs: 0, cosine: true}
 train:
-  dataset_path: <LVD1689M+IN1k>
+  dataset_path: <LVD1689M:root=/PATH>+<ImageNet:split=TRAIN:root=/PATH:extra=/PATH>   # '+'-split: LVD + IN1k
   OFFICIAL_EPOCH_LENGTH: 1250         # 100000 iters total -> set optim.epochs = 80
   compile: true
   checkpointing: true

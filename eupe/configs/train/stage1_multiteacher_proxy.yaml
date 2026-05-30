@@ -13,6 +13,7 @@ distill:
   adapter_hidden_dim: 1536
   normalizer_warmup_iters: 500
   loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+  imagenet_prob: 0.10                  # P(homogeneous ImageNet-1k batch) vs LVD (paper §3.4)
 student:                              # see proxy/vitg_p16.yaml; merge it in via opts at launch
   arch: vit_giant2
   patch_size: 16
@@ -27,6 +28,6 @@ optim:
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 train:
-  dataset_path: <LVD1689M+IN1k>       # see eupe/data/distillation_loaders.py
+  dataset_path: <LVD1689M:root=/PATH>+<ImageNet:split=TRAIN:root=/PATH:extra=/PATH>   # '+'-split: LVD + IN1k (mixed at distill.imagenet_prob); see eupe/data/distillation_loaders.py
   compile: true
   checkpointing: true

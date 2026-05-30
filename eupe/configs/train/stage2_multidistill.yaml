@@ -22,6 +22,7 @@ distill:
   adapter_hidden_dim: 3072
   normalizer_warmup_iters: 500
   loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+  imagenet_prob: 0.10                  # P(homogeneous ImageNet-1k batch) vs LVD (paper §3.4)
 crops:
   global_crops_size: 256
 optim:
@@ -32,7 +33,7 @@ optim:
 schedules:                            # schedules-v2: set peak LR directly (target paper's 2e-5)
   lr: {start: 0.0, peak: 2.0e-05, end: 0.0, warmup_epochs: 0, cosine: true}
 train:
-  dataset_path: <LVD1689M+IN1k>
+  dataset_path: <LVD1689M:root=/PATH>+<ImageNet:split=TRAIN:root=/PATH:extra=/PATH>   # '+'-split: LVD + IN1k
   OFFICIAL_EPOCH_LENGTH: 1250         # 390000 iters total -> set optim.epochs = 312
   compile: true
   checkpointing: true
