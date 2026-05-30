@@ -4,3 +4,4 @@ loader: PECoreTeacher
 checkpoint: <PATH/TO/PEcore-G.pt>   # facebookresearch/perception_models
 native_resolution: 448
 embed_dim: 1536
+pe_config: PE-Core-G14-448          # perception_models vision-config key (pool_type=attn, width 1536)

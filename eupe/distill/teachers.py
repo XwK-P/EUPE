@@ -76,27 +76,37 @@ class _PEVisionTeacher(TeacherModel):
         # Apply the post-norm so pooled cls + patch tokens are taken from the normalized features,
         # matching VisionTransformer.forward which runs forward_features(norm=True) before _pool.
         tokens = self.model.forward_features(img, norm=True)
-        cls = self.model._pool(tokens)
-        patch = tokens[:, int(self.model.use_cls_token):]
+        has_cls = bool(getattr(self.model, "use_cls_token", False))
+        patch = tokens[:, 1:] if has_cls else tokens
+        # _pool returns [B, d] for pool_type in {attn, avg, tok} (PE-Core uses attn). PE-Lang sets
+        # pool_type="none", so _pool returns the FULL [B, N, d] sequence — fall back to a mean summary
+        # (or the cls token when one exists) so "cls" is always a [B, d] vector for the cls adapter/loss.
+        pooled = self.model._pool(tokens)
+        if pooled.ndim == 2:
+            cls = pooled
+        elif has_cls:
+            cls = tokens[:, 0]
+        else:
+            cls = tokens.mean(dim=1)
         return {"cls": cls, "patch": patch}
 
 
 class PECoreTeacher(_PEVisionTeacher):
     """PEcore-G image-understanding teacher (facebookresearch/perception_models)."""
 
-    def __init__(self, checkpoint: str, native_resolution: int = 448):
-        # RECONSTRUCTED (unverified): PE config-name lookup ("pecore_g" -> "PE-Core-G14-448") and the
-        # from_config + load_ckpt + _pool/token-strip forward path; the EUPE teacher config carries only
-        # a checkpoint, so the perception_models config key is inferred from the loader identity.
-        super().__init__(_PE_CONFIG_FOR_NAME["pecore_g"], checkpoint, native_resolution)
+    def __init__(self, checkpoint: str, native_resolution: int = 448, config_name: str | None = None):
+        # The perception_models vision-config key may be supplied via the teacher YAML (`pe_config`);
+        # otherwise default to the canonical PE-Core-G14-448 (width 1536, pool_type=attn) for this loader.
+        super().__init__(config_name or _PE_CONFIG_FOR_NAME["pecore_g"], checkpoint, native_resolution)
 
 
 class PELangTeacher(_PEVisionTeacher):
     """PElang-G VLM/OCR teacher (facebookresearch/perception_models)."""
 
-    def __init__(self, checkpoint: str, native_resolution: int = 448):
-        # RECONSTRUCTED (unverified): PE config-name lookup ("pelang_g" -> "PE-Lang-G14-448"); see PECoreTeacher.
-        super().__init__(_PE_CONFIG_FOR_NAME["pelang_g"], checkpoint, native_resolution)
+    def __init__(self, checkpoint: str, native_resolution: int = 448, config_name: str | None = None):
+        # Config key via the teacher YAML (`pe_config`) or the default PE-Lang-G14-448 (pool_type=none,
+        # so _PEVisionTeacher.forward mean-pools the cls). See PECoreTeacher.
+        super().__init__(config_name or _PE_CONFIG_FOR_NAME["pelang_g"], checkpoint, native_resolution)
 
 
 class DINOv3Teacher(TeacherModel):
@@ -105,27 +115,30 @@ class DINOv3Teacher(TeacherModel):
     # Ported from refs/dinov3/dinov3/models/vision_transformer.py::DinoVisionTransformer.forward_features
     # - Returns the dict {"x_norm_clstoken", "x_norm_patchtokens", ...}; we surface cls/patch from it.
     #   Loaded through the hub entrypoint `dinov3_vith16plus` (DINOv3-H+, 840M, embed_dim 1280).
-    def __init__(self, checkpoint: str, native_resolution: int = 256):
+    def __init__(self, checkpoint: str, native_resolution: int = 256,
+                 hub_entrypoint: str = "dinov3_vith16plus", embed_dim: int = 1280):
         super().__init__()
         self.native_resolution = native_resolution
-        self.embed_dim = 1280
+        # embed_dim + hub entrypoint default to DINOv3-H+ (840M, 1280) but are overridable from the
+        # teacher YAML (`hub_entrypoint`, `embed_dim`) so other DINOv3 variants can be swapped in.
+        self.embed_dim = embed_dim
         has_ckpt = bool(checkpoint) and not checkpoint.startswith("<")
         try:
             # LAZY import: torch.hub.load pulls in the dinov3 package only when a teacher is built.
             self.model = torch.hub.load(
                 "facebookresearch/dinov3",
-                "dinov3_vith16plus",
+                hub_entrypoint,
                 source="github",
                 pretrained=has_ckpt,
                 weights=checkpoint if has_ckpt else None,
             )
         except Exception:
-            # RECONSTRUCTED (unverified): fall back to a locally cloned dinov3 repo (offline / no network).
-            # DINOV3_LOCATION points at the dinov3 source tree; mirrors the upstream local-hub recipe.
+            # Fall back to a locally cloned dinov3 repo (offline / no network). DINOV3_LOCATION points
+            # at the dinov3 source tree; mirrors the upstream local-hub recipe.
             dinov3_location = os.environ.get("DINOV3_LOCATION", "facebookresearch/dinov3")
             self.model = torch.hub.load(
                 dinov3_location,
-                "dinov3_vith16plus",
+                hub_entrypoint,
                 source="local" if os.path.isdir(dinov3_location) else "github",
                 pretrained=has_ckpt,
                 weights=checkpoint if has_ckpt else None,
@@ -181,6 +194,10 @@ _TEACHER_REGISTRY = {
     "proxy": ProxyTeacher,
 }
 
+# A teacher YAML's `loader:` field may name either a short registry key (e.g. "pecore_g") or the
+# loader class itself (e.g. "PECoreTeacher", as the shipped teacher configs do).
+_LOADER_BY_CLASSNAME = {cls.__name__: cls for cls in set(_TEACHER_REGISTRY.values())}
+
 
 def _resolve_teacher_entry(entry):
     """Merge an inline teacher entry with its referenced teacher config file (if any).
@@ -213,13 +230,14 @@ def build_teachers(cfg) -> Dict[str, TeacherModel]:
     for entry in cfg.distill.teachers:
         merged, config_path = _resolve_teacher_entry(entry)
         name = merged["name"]
-        # Prefer an explicit `loader` field; otherwise dispatch by teacher name.
+        # Prefer an explicit `loader` field (short registry key OR class name); else dispatch by name.
         loader_key = merged.get("loader", None)
-        if loader_key is not None and loader_key in _TEACHER_REGISTRY:
-            loader_cls = _TEACHER_REGISTRY[loader_key]
-        elif name in _TEACHER_REGISTRY:
+        loader_cls = None
+        if loader_key is not None:
+            loader_cls = _TEACHER_REGISTRY.get(loader_key) or _LOADER_BY_CLASSNAME.get(loader_key)
+        if loader_cls is None and name in _TEACHER_REGISTRY:
             loader_cls = _TEACHER_REGISTRY[name]
-        else:
+        if loader_cls is None:
             raise KeyError(f"No teacher loader registered for entry name={name!r} loader={loader_key!r}")
 
         checkpoint = merged.get("checkpoint", None)
@@ -236,6 +254,15 @@ def build_teachers(cfg) -> Dict[str, TeacherModel]:
             kwargs = {"checkpoint": checkpoint}
             if native_resolution is not None:
                 kwargs["native_resolution"] = native_resolution
+            # Config-driven external identifiers (let the teacher YAML supply what was previously
+            # inferred from loader identity): PE config key, DINOv3 hub entrypoint + embed_dim.
+            if loader_cls in (PECoreTeacher, PELangTeacher) and merged.get("pe_config") is not None:
+                kwargs["config_name"] = merged.get("pe_config")
+            if loader_cls is DINOv3Teacher:
+                if merged.get("hub_entrypoint") is not None:
+                    kwargs["hub_entrypoint"] = merged.get("hub_entrypoint")
+                if merged.get("embed_dim") is not None:
+                    kwargs["embed_dim"] = int(merged.get("embed_dim"))
             teacher = loader_cls(**kwargs)
 
         teacher = teacher.cuda().eval().requires_grad_(False)

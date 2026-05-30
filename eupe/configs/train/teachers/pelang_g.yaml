@@ -4,3 +4,4 @@ loader: PELangTeacher
 checkpoint: <PATH/TO/PElang-G.pt>   # facebookresearch/perception_models
 native_resolution: 448
 embed_dim: 1536
+pe_config: PE-Lang-G14-448          # perception_models key (pool_type=none -> cls is mean-pooled)
