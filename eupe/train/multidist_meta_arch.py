@@ -13,7 +13,7 @@ swapped for DistillationLoss. crops.teacher_to_student_resolution_scale downsamp
 to the student resolution (e.g. Stage-3 multi-res).
 """
 import logging
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,14 +56,17 @@ class MultiDistillationMetaArch(DistillationMetaArch):
         return catted.chunk(subgroup_size, dim=over_dim)[distributed.get_subgroup_rank()].clone()
 
     @torch.no_grad()
-    def get_teacher_output(self, images: Tensor, *, global_batch_size: int) -> Dict[str, Dict[str, Tensor]]:
+    def get_teacher_output(
+        self, images: Tensor, *, global_batch_size: int, override_resolution: Optional[int] = None
+    ) -> Dict[str, Dict[str, Tensor]]:
         """Run the frozen proxy once on the global batch, then broadcast to this rank's subgroup."""
         # Ported from refs/dinov3/dinov3/train/multidist_meta_arch.py:get_teacher_output —
         # divergence: dinov3 runs DINO/iBOT heads + Sinkhorn centering and broadcasts the centered
         # logits; here the single proxy returns raw {cls,patch} (DistillationMetaArch.get_teacher_outputs
         # already forwards each teacher at its native resolution under no_grad), so we just broadcast
         # each cls/patch tensor along the batch dim (over_dim=0) to this rank's subgroup slice.
-        teacher_outputs = self.get_teacher_outputs(images)
+        # override_resolution lets Stage 3 run the proxy at an independently-sampled pyramid scale.
+        teacher_outputs = self.get_teacher_outputs(images, override_resolution=override_resolution)
         subgroup_outputs: Dict[str, Dict[str, Tensor]] = {}
         for name, tokens in teacher_outputs.items():
             subgroup_outputs[name] = {
@@ -82,28 +85,42 @@ class MultiDistillationMetaArch(DistillationMetaArch):
         # no global/local crops or masks; a single global-crop tensor is run through the proxy ONCE
         # (replicated on every world rank), the teacher output is broadcast to this rank's subgroup,
         # and the local student backprops against it via the inherited DistillationLoss.
-        del iteration, ignored
+        del ignored
         images = self._extract_images(data).cuda(non_blocking=True)
         global_batch_size = self._extract_global_batch_size(data, images)
 
-        # Downsample the proxy crops to the student resolution (Stage-3 multi-res). The teacher still
-        # runs once on the (down)sampled global batch on every rank before the subgroup broadcast.
-        downsampling_factor = float(self.cfg.crops.get("teacher_to_student_resolution_scale", 1.0))
-        if downsampling_factor != 1.0:
-            images = F.interpolate(
-                images,
-                scale_factor=1.0 / downsampling_factor,
-                mode="bilinear",
-                antialias=True,
-            )
+        # Stage-3 multi-resolution (paper §3.1): the teacher and student EACH pick one scale from the
+        # pyramid INDEPENDENTLY per iteration. We draw both scales with an iteration-seeded generator
+        # so every world rank agrees on them — otherwise the cross-rank all-gather of student/teacher
+        # tensors below would see mismatched spatial shapes and crash. The data loader hands us images
+        # at the largest crop size; we resize the student input to its scale and let the teacher read
+        # its own (independent) scale via override_resolution. For fixed-res Stage 2 (no pyramid) this
+        # is a no-op and the optional teacher_to_student_resolution_scale downsample is applied instead.
+        pyramid = self._pyramid_scales()
+        teacher_override = None
+        if pyramid is not None:
+            student_scale, teacher_scale = self._sample_pyramid_scales(pyramid, iteration)
+            student_images_global = self._resize_square(images, student_scale)
+            teacher_input = images
+            teacher_override = teacher_scale
+        else:
+            downsampling_factor = float(self.cfg.crops.get("teacher_to_student_resolution_scale", 1.0))
+            if downsampling_factor != 1.0:
+                images = F.interpolate(
+                    images, scale_factor=1.0 / downsampling_factor, mode="bilinear", antialias=True
+                )
+            student_images_global = images
+            teacher_input = images
 
-        # Shared teacher: run the frozen proxy once on the global batch, then hand this rank's
-        # subgroup its slice (all-gather -> cat -> narrow -> chunk).
-        teacher_outputs = self.get_teacher_output(images, global_batch_size=global_batch_size)
+        # Shared teacher: run the frozen proxy once on the global batch (at its independent scale),
+        # then hand this rank's subgroup its slice (all-gather -> cat -> narrow -> chunk).
+        teacher_outputs = self.get_teacher_output(
+            teacher_input, global_batch_size=global_batch_size, override_resolution=teacher_override
+        )
 
-        # Local student: each subgroup only owns its slice of the global batch.
+        # Local student: each subgroup only owns its slice of the global batch (at the student scale).
         student_images = self.broadcast_to_subgroups(
-            images, global_batch_size=global_batch_size, over_dim=0
+            student_images_global, global_batch_size=global_batch_size, over_dim=0
         )
         student_out = self.student.forward_features(student_images)
         student_cls = student_out["x_norm_clstoken"]
@@ -114,6 +131,34 @@ class MultiDistillationMetaArch(DistillationMetaArch):
         self.backprop_loss(loss_dict["loss"])
 
         return loss_dict
+
+    def _pyramid_scales(self) -> Optional[List[int]]:
+        """Return the resolution pyramid (Stage 3) as a list of ints, or None for fixed-res (Stage 2)."""
+        gcs = self.cfg.crops.get("global_crops_size", None)
+        is_pyramid = isinstance(gcs, (list, tuple)) or (
+            hasattr(gcs, "__iter__") and not isinstance(gcs, (str, bytes, int))
+        )
+        return [int(s) for s in gcs] if is_pyramid else None
+
+    @staticmethod
+    def _sample_pyramid_scales(scales: List[int], iteration: int) -> Tuple[int, int]:
+        """Draw (student_scale, teacher_scale) INDEPENDENTLY from the pyramid for this iteration.
+
+        Seeded by `iteration` so every rank draws the SAME pair (required: the two scales drive the
+        spatial shapes of cross-rank all-gathers). The two draws are independent of each other, which
+        is what the paper means by the teacher and student each selecting a scale independently.
+        """
+        generator = torch.Generator().manual_seed(int(iteration))
+        student_idx = int(torch.randint(len(scales), (1,), generator=generator).item())
+        teacher_idx = int(torch.randint(len(scales), (1,), generator=generator).item())
+        return scales[student_idx], scales[teacher_idx]
+
+    @staticmethod
+    def _resize_square(images: Tensor, size: int) -> Tensor:
+        """Bicubic-resize a [B, C, H, W] batch to (size, size); no-op if already there."""
+        if images.shape[-1] == size and images.shape[-2] == size:
+            return images
+        return F.interpolate(images, size=(size, size), mode="bicubic", align_corners=False)
 
     def _extract_global_batch_size(self, data, images: Tensor) -> int:
         """Resolve the true global batch size for the subgroup broadcast.

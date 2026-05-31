@@ -1,6 +1,6 @@
 # EUPE ViT-T/16 student (6M). Matches eupe/hub/backbones.py::eupe_vitt16.
 student:
-  arch: vit_small            # overridden by explicit dims below
+  arch: vit_small            # selects the ViT family; build_model threads the explicit dims below (192/12/3 = ViT-T, NOT vit_small's 384/12/6)
   embed_dim: 192
   depth: 12
   num_heads: 3

@@ -9,13 +9,17 @@ compute_precision:
 multidistillation:                    # rank-partition launcher (eupe/configs/config.py::setup_multidistillation)
   enabled: true
   global_batch_size: 8192
+  # ranks_range spans MUST each divide global_batch_size, and the total (128) must divide it too
+  # (setup_multidistillation asserts global_batch_size % span == 0 and sets
+  # batch_size_per_gpu = global_batch_size // world_size). 8192 % {16,32} == 0 and 8192 % 128 == 0.
+  # This is an example 128-GPU (16-node x 8) layout — scale spans to your cluster, keeping divisibility.
   students:
     - {name: vitt,           config_path: eupe/configs/train/students/vitt_p16.yaml,           ranks_range: [0, 16]}
-    - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 40]}
-    - {name: vitb,           config_path: eupe/configs/train/students/vitb_p16.yaml,           ranks_range: [40, 88]}
-    - {name: convnext_tiny,  config_path: eupe/configs/train/students/convnext_tiny_p16.yaml,  ranks_range: [88, 104]}
-    - {name: convnext_small, config_path: eupe/configs/train/students/convnext_small_p16.yaml, ranks_range: [104, 128]}
-    - {name: convnext_base,  config_path: eupe/configs/train/students/convnext_base_p16.yaml,  ranks_range: [128, 168]}
+    - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 32]}
+    - {name: vitb,           config_path: eupe/configs/train/students/vitb_p16.yaml,           ranks_range: [32, 64]}
+    - {name: convnext_tiny,  config_path: eupe/configs/train/students/convnext_tiny_p16.yaml,  ranks_range: [64, 80]}
+    - {name: convnext_small, config_path: eupe/configs/train/students/convnext_small_p16.yaml, ranks_range: [80, 96]}
+    - {name: convnext_base,  config_path: eupe/configs/train/students/convnext_base_p16.yaml,  ranks_range: [96, 128]}
 distill:
   teachers:
     - {name: proxy, config: eupe/configs/train/proxy/vitg_p16.yaml, checkpoint: <STAGE1_PROXY_CKPT.pth>}
@@ -27,6 +31,7 @@ crops:
   global_crops_size: 256
 optim:
   optimizer: adamw
+  epochs: 312                         # total iters = OFFICIAL_EPOCH_LENGTH * epochs = 1250 * 312 = 390000 (paper §4.1)
   weight_decay: 1.0e-04
   adamw_beta1: 0.9
   adamw_beta2: 0.999
@@ -34,7 +39,6 @@ schedules:                            # schedules-v2: set peak LR directly (targ
   lr: {start: 0.0, peak: 2.0e-05, end: 0.0, warmup_epochs: 0, cosine: true}
 train:
   dataset_path: <LVD1689M:root=/PATH>+<ImageNet:split=TRAIN:root=/PATH:extra=/PATH>   # '+'-split: LVD + IN1k
-  OFFICIAL_EPOCH_LENGTH: 1250         # 390000 iters total -> set optim.epochs = 312
+  OFFICIAL_EPOCH_LENGTH: 1250         # x optim.epochs(312) = 390000 iters (paper §4.1)
   compile: true
   checkpointing: true
-optim_total_iters: 390000             # documented target; map to epochs via OFFICIAL_EPOCH_LENGTH

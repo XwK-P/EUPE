@@ -7,11 +7,13 @@
 
 Interleave homogeneous ImageNet-1k batches with heterogeneous LVD-1689M batches, P(ImageNet)=0.10.
 Augmentations: random-resized crop, horizontal flip, color jitter, Gaussian blur, solarization
-(Stage 2). Stage 3 adds an independent per-sample scale draw from {256,384,512}. Reuses
-eupe/data/{loaders.py, samplers.py, transforms.py}.
+(Stage 2). For Stage 3 the loader produces crops at the LARGEST pyramid size; the per-iteration
+pyramid scaling (teacher and student each pick a scale INDEPENDENTLY, paper §3.1) is done in
+eupe/train/multidist_meta_arch.py so the two scales are rank-synchronized for the cross-rank
+all-gather. Reuses eupe/data/{loaders.py, samplers.py, transforms.py}.
 """
 import logging
-from typing import Iterable, List
+from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader
@@ -156,38 +158,6 @@ class _MixedRoutingDataset(torch.utils.data.Dataset):
         return image, source
 
 
-def build_pyramid_collate(scales: List[int]):
-    """Return a collate_fn that resizes the whole batch to ONE scale sampled per iteration (Stage 3).
-
-    Report §7.3: "teacher & student each pick one scale independently per step." So a single scale is
-    drawn per *batch* (not per sample); every image is bicubic-resized to `(scale, scale)` and the
-    batch is cleanly stacked into `[B, C, scale, scale]`. A per-sample scale would force padding to a
-    common size, which feeds black borders — and shifted RoPE positions — into the encoder. The
-    teacher samples its own scale independently via `crops.teacher_to_student_resolution_scale`.
-    Returns `(images, sources)`.
-
-    Stage 3 multi-resolution pyramid {256, 384, 512} (paper §3.4).
-    """
-    scales = [int(s) for s in scales]
-
-    def collate_fn(batch):
-        # `batch` is a list of (image_tensor[C,H,W], source) produced by the transform pipeline.
-        images, sources = zip(*batch)
-        scale = scales[torch.randint(len(scales), (1,)).item()]  # one scale per iteration (per step)
-        resized = [
-            v2.functional.resize(
-                img,
-                [scale, scale],
-                interpolation=v2.InterpolationMode.BICUBIC,
-                antialias=True,
-            )
-            for img in images
-        ]
-        return torch.stack(resized, dim=0), list(sources)
-
-    return collate_fn
-
-
 def _default_collate(batch):
     """Stack a homogeneous-size batch of (image, source) into ([B,C,H,W], [source,...])."""
     images, sources = zip(*batch)
@@ -201,8 +171,9 @@ def make_distillation_data_loader(cfg) -> Iterable:
     `make_dataset` string, e.g. "ImageNet:split=TRAIN:root=..."). The single-source case (no "+")
     is treated as both LVD and ImageNet pointing at the same dataset.
 
-    If `cfg.crops.global_crops_size` is a list, attach `build_pyramid_collate` (Stage 3) over those
-    scales and build the RRC transform at the largest scale; otherwise use the scalar crop size.
+    If `cfg.crops.global_crops_size` is a list (Stage 3), build the RRC transform at the LARGEST
+    scale and stack batches at that size; the per-iteration pyramid scaling (independent teacher /
+    student scales) is handled in the meta-arch. Otherwise use the scalar crop size.
     """
     # Provenance: reuses eupe/data/{loaders,samplers,transforms}.py; mixing recipe (P(IN1k)=0.10)
     # ported from refs/dinov3 IN1k/LVD interleave — single-view distillation augmentation.
@@ -257,7 +228,10 @@ def make_distillation_data_loader(cfg) -> Iterable:
     )
     routing_dataset = _MixedRoutingDataset(lvd_dataset, imagenet_dataset)
 
-    collate_fn = build_pyramid_collate(scales) if is_pyramid else _default_collate
+    # Stage 3 produces uniform max-scale crops here; multidist_meta_arch resizes to the independent
+    # per-iteration teacher/student pyramid scales (rank-synchronized). So a plain stack collate is
+    # used for both fixed-res and pyramid configs.
+    collate_fn = _default_collate
 
     logger.info("using PyTorch data loader (distillation mixed LVD+IN1k)")
     data_loader = DataLoader(

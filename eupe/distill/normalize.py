@@ -13,6 +13,7 @@ avoids a per-step cross-GPU all-gather and lets batch size scale across nodes.
 from typing import Dict, Iterable
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from eupe import distributed
@@ -100,7 +101,13 @@ def estimate_teacher_statistics(
             images = _extract_images(batch)
             for name, teacher in teachers.items():
                 device = next((p.device for p in teacher.parameters()), images.device)
-                out = teacher(images.to(device))
+                # Resize to the teacher's native resolution BEFORE the forward, matching the
+                # training-time DistillationMetaArch.get_teacher_outputs, so the frozen normalizer
+                # stats are measured at the SAME resolution the teacher actually sees during
+                # distillation (paper §3.3). Without this, PE teachers (native 448) would be measured
+                # at the student/crop resolution (e.g. 256) and the frozen stats would not match training.
+                teacher_images = _resize_to_native(images.to(device), teacher)
+                out = teacher(teacher_images)
                 for token_type in ("cls", "patch"):
                     _accumulate(name, token_type, out[token_type])
 
@@ -125,6 +132,18 @@ def estimate_teacher_statistics(
             norm.set_stats(mean, std)
             normalizers[name][token_type] = norm
     return normalizers
+
+
+def _resize_to_native(images: Tensor, teacher) -> Tensor:
+    """Bicubic-resize images to the teacher's native_resolution (no-op if absent or already there).
+
+    Mirrors DistillationMetaArch.get_teacher_outputs (bicubic, align_corners=False) so the normalizer
+    warmup measures each teacher at the same resolution training feeds it.
+    """
+    res = getattr(teacher, "native_resolution", None)
+    if res is None or (images.shape[-1] == res and images.shape[-2] == res):
+        return images
+    return F.interpolate(images, size=(int(res), int(res)), mode="bicubic", align_corners=False)
 
 
 def _extract_images(batch) -> Tensor:

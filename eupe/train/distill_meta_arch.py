@@ -11,7 +11,7 @@ per-teacher adapter heads, frozen feature normalizers, and the DistillationLoss.
 DINOv3's DINO/iBOT/Sinkhorn objective with RADIO-style feature matching (paper §3).
 """
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -100,17 +100,21 @@ class DistillationMetaArch(nn.Module):
         logger.info("Teacher statistics frozen for teachers=%s", list(estimated.keys()))
 
     @torch.no_grad()
-    def get_teacher_outputs(self, images: Tensor) -> Dict[str, Dict[str, Tensor]]:
+    def get_teacher_outputs(
+        self, images: Tensor, override_resolution: Optional[int] = None
+    ) -> Dict[str, Dict[str, Tensor]]:
         """Forward each frozen teacher at its native resolution; return raw {name:{cls,patch}}.
 
-        Resize `images` per teacher.native_resolution before the forward (no_grad).
+        Resize `images` per teacher.native_resolution before the forward (no_grad). When
+        `override_resolution` is given (Stage-3 multi-resolution: the teacher samples its own pyramid
+        scale per iteration) it is used instead of the teacher's fixed native_resolution.
         """
         # Ported from refs/dinov3/dinov3/train/ssl_meta_arch.py:get_teacher_output — divergence:
         # no DINO/iBOT heads or Sinkhorn centering; each teacher is run once at its own native
         # resolution and returns raw {cls,patch}. Resize is bicubic (matches the loss-side interp).
         outputs: Dict[str, Dict[str, Tensor]] = {}
         for name, teacher in self.teachers.items():
-            res = teacher.native_resolution
+            res = override_resolution if override_resolution is not None else teacher.native_resolution
             if images.shape[-1] != res or images.shape[-2] != res:
                 teacher_images = F.interpolate(
                     images,

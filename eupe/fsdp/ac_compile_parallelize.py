@@ -151,8 +151,9 @@ def parallelize(model: nn.Module, cfg) -> nn.Module:
     # — divergence from the prior FSDP1 port: this now uses FSDP2 fully_shard (DTensor sharding),
     #   which is the meta-init path dinov3 uses; cfg.compute_precision.sharding_strategy is mapped to
     #   reshard_after_forward rather than a ShardingStrategy enum.
+    import eupe.distributed as eupe_distributed
     from torch.distributed._composable.fsdp import MixedPrecisionPolicy
-    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
     from torch.distributed.fsdp import register_fsdp_forward_method
 
     logger.info("DISTRIBUTED FSDP2 -- preparing model for distributed training")
@@ -181,7 +182,16 @@ def parallelize(model: nn.Module, cfg) -> nn.Module:
             model = model.cuda()
         return model
 
-    mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
+    # In multidistillation each rank builds ONLY its assigned student, so the FSDP mesh must span
+    # that student's process SUBGROUP, not the whole world — sharding a student across ranks that
+    # hold a different student would deadlock / mis-shard the collectives. get_process_subgroup()
+    # returns this rank's subgroup in multidist runs and the default (world) group in single-student
+    # runs (Stage 1), so DeviceMesh.from_group is correct in both cases.
+    process_group = eupe_distributed.get_process_subgroup()
+    if eupe_distributed.get_subgroup_size() < dist.get_world_size():
+        mesh = DeviceMesh.from_group(process_group, "cuda")
+    else:
+        mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
     fsdp_config = {"mesh": mesh, "mp_policy": mp_policy}
     if _is_convnext(model):
         _fully_shard_convnext(model, fsdp_config, reshard_after_forward)

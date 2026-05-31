@@ -25,3 +25,23 @@ def test_estimate_statistics_recovers_distribution():
     norms = estimate_teacher_statistics({"t": DummyTeacher()}, loader, n_iters=200)
     assert torch.allclose(norms["t"]["cls"].mean, torch.full((8,), mu), atol=0.3)
     assert torch.allclose(norms["t"]["cls"].std,  torch.full((8,), sd), atol=0.3)
+
+
+def test_estimate_statistics_forwards_teacher_at_native_resolution():
+    # M19: the warmup must resize to each teacher's native_resolution (matching training), not feed
+    # the raw crop resolution — otherwise frozen stats for PE teachers (native 448) are measured at
+    # the student crop size (e.g. 256) and mismatch training.
+    seen = {}
+
+    class ResTeacher(torch.nn.Module):
+        embed_dim = 4
+        native_resolution = 96
+
+        def forward(self, img):
+            seen["hw"] = (int(img.shape[-2]), int(img.shape[-1]))
+            b = img.shape[0]
+            return {"cls": torch.zeros(b, 4), "patch": torch.zeros(b, 3, 4)}
+
+    loader = ([torch.randn(2, 3, 64, 64)] for _ in range(1))  # crop res 64 != native 96
+    estimate_teacher_statistics({"t": ResTeacher()}, loader, n_iters=1)
+    assert seen["hw"] == (96, 96)

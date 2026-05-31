@@ -158,7 +158,7 @@ class ProxyTeacher(TeacherModel):
     #   DinoVisionTransformer.forward_features dict (same x_norm_* keys as DINOv3Teacher).
     def __init__(self, config: str, checkpoint: str, native_resolution: int = 256):
         super().__init__()
-        from eupe.models import build_model
+        from eupe.models import build_model, extract_backbone_state_dict
 
         self.native_resolution = native_resolution
 
@@ -169,14 +169,9 @@ class ProxyTeacher(TeacherModel):
 
         if checkpoint and not checkpoint.startswith("<"):
             model.to_empty(device="cuda")
-            state_dict = torch.load(checkpoint, map_location="cpu")
-            if "teacher" in state_dict:
-                teacher_sd = {
-                    k.replace("teacher.", ""): v for k, v in state_dict.items() if k.startswith("teacher.")
-                }
-                model.load_state_dict(teacher_sd, strict=True)
-            else:
-                model.load_state_dict(state_dict, strict=True)
+            # Handles the {"teacher": {"teacher.<k>": v}} training payload and flat/plain layouts.
+            state_dict = extract_backbone_state_dict(torch.load(checkpoint, map_location="cpu"))
+            model.load_state_dict(state_dict, strict=True)
         else:
             logger.warning("No checkpoint provided for proxy teacher; initializing weights")
             model.init_weights()

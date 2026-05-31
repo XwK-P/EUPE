@@ -242,6 +242,28 @@ def _save_checkpoint(cfg, model, optimizer, iteration: int) -> None:
     logger.info("Saved checkpoint: %s", ckpt_path)
 
 
+def _load_student_init_checkpoint(student, checkpoint_path) -> None:
+    """Initialize the student from a prior-stage checkpoint (Stage 3 finetunes from Stage 2; paper §3.1).
+
+    Called BEFORE FSDP sharding (so fully_shard shards the loaded weights) and AFTER init_weights()
+    (so non-persistent buffers such as the RoPE periods are populated, then params are overwritten).
+    Reuses eupe.models.extract_backbone_state_dict to accept the {"teacher": {...}} training payload
+    and strip FSDP/AC/compile name decorations.
+    """
+    from eupe.models import extract_backbone_state_dict
+
+    logger.info("Initializing student from prior-stage checkpoint: %s", checkpoint_path)
+    state_dict = extract_backbone_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    missing, unexpected = student.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        logger.warning(
+            "student init from %s: %d missing / %d unexpected keys (missing[:3]=%s unexpected[:3]=%s)",
+            checkpoint_path, len(missing), len(unexpected), list(missing)[:3], list(unexpected)[:3],
+        )
+    else:
+        logger.info("student init from checkpoint: all keys matched")
+
+
 def _clip_gradients(model, max_norm: float) -> None:
     """Clip grads of the (FSDP-sharded) student and the (non-FSDP) adapter heads.
 
@@ -412,17 +434,35 @@ def main(args=None) -> int:
         # teacher checkpoint load — and the old blanket model.to_empty() would then zero their weights.
         model = meta_arch_cls(cfg)
 
-        # FSDP-wrap ONLY the student backbone (teachers stay frozen/eval inside the meta-arch).
-        model.student = parallelize(model.student, cfg)
-
-        # Materialize + initialize the student if it is still on meta (e.g. the single-process
-        # fallback where parallelize skipped FSDP). We never to_empty the WHOLE model — that would
-        # wipe the teachers' loaded checkpoints and the adapter init.
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        if any(p.is_meta for p in model.student.parameters()):
-            model.student.to_empty(device=device)
-        if hasattr(model.student, "init_weights"):
-            model.student.init_weights()  # NOTE: FSDP1 meta-init path — validate on GPU.
+
+        # Stage-3 finetune: an optional student-init checkpoint (the Stage-2 weights) to load BEFORE
+        # FSDP sharding, so fully_shard shards the LOADED weights rather than random init. Placeholder
+        # "<...>" paths are treated as unset. Students are <=~90M, so the brief unsharded
+        # materialization needed to load + then shard is cheap (the 1.9B proxy never takes this path).
+        init_ckpt = cfg.student.get("pretrained_weights", None) if "student" in cfg else None
+        has_init = bool(init_ckpt) and not str(init_ckpt).startswith("<")
+
+        if has_init:
+            # Materialize + init the unsharded student (fills non-persistent RoPE buffers), OVERWRITE
+            # its parameters with the checkpoint, THEN FSDP-shard the now-loaded weights.
+            if any(p.is_meta for p in model.student.parameters()):
+                model.student.to_empty(device=device)
+            if hasattr(model.student, "init_weights"):
+                model.student.init_weights()
+            _load_student_init_checkpoint(model.student, init_ckpt)
+            model.student = parallelize(model.student, cfg)
+        else:
+            # FSDP-wrap ONLY the student backbone (teachers stay frozen/eval inside the meta-arch).
+            model.student = parallelize(model.student, cfg)
+            # Materialize + initialize the student if it is still on meta (e.g. the single-process
+            # fallback where parallelize skipped FSDP). We never to_empty the WHOLE model — that would
+            # wipe the teachers' loaded checkpoints and the adapter init.
+            if any(p.is_meta for p in model.student.parameters()):
+                model.student.to_empty(device=device)
+            if hasattr(model.student, "init_weights"):
+                model.student.init_weights()  # FSDP2 meta-init path — validate on GPU.
+
         # Place the trainable adapters + frozen normalizer buffers on the compute device (the teachers
         # were already moved to cuda by build_teachers).
         if torch.cuda.is_available():
