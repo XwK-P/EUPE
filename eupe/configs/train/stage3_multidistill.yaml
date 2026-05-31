@@ -36,6 +36,7 @@ optim:
   weight_decay: 1.0e-04
   layerwise_decay: 1.0                # single flat base LR (paper §4.1) — override ssl_default's 0.9
   patch_embed_lr_mult: 1.0            #   (Stage-3 finetune of the small students; no per-layer decay)
+  clip_grad: 3.0                      # paper is SILENT on grad clipping; 3.0 is the inherited dinov3 default.
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 schedules:

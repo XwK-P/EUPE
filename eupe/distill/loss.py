@@ -73,6 +73,11 @@ class DistillationLoss(nn.Module):
             return t
         side = int(round(math.sqrt(n)))
         target_side = int(round(math.sqrt(n_target)))
+        # Fail loudly (not with a confusing deep reshape error) if a teacher/student ever emits a
+        # non-square patch grid. All EUPE encoders emit square grids at the paper resolutions (register
+        # tokens are stripped from x_norm_patchtokens; ConvNeXt grids are square), so this never fires today.
+        assert side * side == n, f"_resize_grid expects a square patch grid, got N={n}"
+        assert target_side * target_side == n_target, f"_resize_grid expects a square target grid, got N={n_target}"
         # [B, N, d] -> [B, d, sqrt(N), sqrt(N)]
         grid = t.transpose(1, 2).reshape(b, d, side, side)
         grid = F.interpolate(grid, size=(target_side, target_side), mode="bicubic", align_corners=False)
@@ -80,7 +85,13 @@ class DistillationLoss(nn.Module):
         return grid.reshape(b, d, target_side * target_side).transpose(1, 2)
 
     def patch_loss(self, z: Tensor, y: Tensor) -> Tensor:
-        """alpha * cosine_loss + beta * smooth_l1, after spatial alignment."""
+        """alpha * cosine_loss + beta * smooth_l1, after spatial alignment.
+
+        smooth_l1 uses PyTorch's default Huber transition (beta=1.0). The paper (Eq. 5) says only
+        "smooth L1" and does not specify the transition point, so 1.0 is a defensible default; note the
+        cosine term is reduced per-token and the smooth-L1 term element-wise, matching the AM-RADIO
+        lineage but meaning the alpha/beta weighting is relative to those two (paper-unspecified) reductions.
+        """
         z, y = self.interpolate_patch_tokens(z, y)
         return self.alpha * self.cosine_loss(z, y) + self.beta * F.smooth_l1_loss(z, y)
 

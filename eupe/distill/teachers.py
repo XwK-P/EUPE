@@ -81,6 +81,10 @@ class _PEVisionTeacher(TeacherModel):
         # _pool returns [B, d] for pool_type in {attn, avg, tok} (PE-Core uses attn). PE-Lang sets
         # pool_type="none", so _pool returns the FULL [B, N, d] sequence — fall back to a mean summary
         # (or the cls token when one exists) so "cls" is always a [B, d] vector for the cls adapter/loss.
+        # FIDELITY NOTE: PE-Lang has no native class token, so its "cls" distillation target is the MEAN
+        # of its own patch tokens (a defensible reconstruction — the paper does not specify how to take a
+        # class token from a pool_type="none" encoder; this mirrors how PE-Core attn-pools the same
+        # normed sequence). It makes PE-Lang's cls loss partially redundant with its patch loss.
         pooled = self.model._pool(tokens)
         if pooled.ndim == 2:
             cls = pooled
@@ -158,12 +162,20 @@ class ProxyTeacher(TeacherModel):
     #   DinoVisionTransformer.forward_features dict (same x_norm_* keys as DINOv3Teacher).
     def __init__(self, config: str, checkpoint: str, native_resolution: int = 256):
         super().__init__()
+        from eupe.configs.config import get_default_config
         from eupe.models import build_model, extract_backbone_state_dict
 
         self.native_resolution = native_resolution
 
         proxy_cfg = OmegaConf.load(config)
         student_cfg = proxy_cfg.student if "student" in proxy_cfg else proxy_cfg
+        # Merge onto the default student block FIRST. The proxy YAML only carries the explicit dims +
+        # a rope subset; build_model unconditionally dereferences base-only keys (qkv_bias, ffn_bias,
+        # proj_bias, the rope min/max/shift/jitter periods, the untie-norm flags, ...). Without this
+        # merge, `OmegaConf.load(vitg_p16.yaml)` lacks those keys and build_model raises
+        # ConfigAttributeError, crashing every Stage-2/3 proxy-teacher build. (The Stage-1 student path
+        # gets these via setup_config's default merge; ProxyTeacher bypasses that, so it must merge here.)
+        student_cfg = OmegaConf.merge(get_default_config().student, student_cfg)
         model, embed_dim = build_model(student_cfg, only_teacher=True, img_size=native_resolution)
         self.embed_dim = embed_dim
 

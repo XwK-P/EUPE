@@ -13,6 +13,10 @@ multidistillation:                    # rank-partition launcher (eupe/configs/co
   # (setup_multidistillation asserts global_batch_size % span == 0 and sets
   # batch_size_per_gpu = global_batch_size // world_size). 8192 % {16,32} == 0 and 8192 % 128 == 0.
   # This is an example 128-GPU (16-node x 8) layout — scale spans to your cluster, keeping divisibility.
+  # NOTE: 8192 is the AGGREGATE co-distillation batch shared across all students via one proxy forward.
+  # Each student's EFFECTIVE per-step batch is (its rank span) x batch_size_per_gpu, e.g. ViT-T (span 16)
+  # sees 16x64=1024 and ViT-B (span 32) sees 2048. To train a student at the literal 8192, give it a
+  # 128-rank span (run it alone) or scale its LR/iters to its actual per-student batch.
   students:
     - {name: vitt,           config_path: eupe/configs/train/students/vitt_p16.yaml,           ranks_range: [0, 16]}
     - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 32]}
@@ -35,6 +39,8 @@ optim:
   weight_decay: 1.0e-04
   layerwise_decay: 1.0                # single flat base LR (paper §4.1) — override ssl_default's 0.9
   patch_embed_lr_mult: 1.0            #   (the students train from scratch, not fine-tune; no per-layer decay)
+  clip_grad: 3.0                      # paper is SILENT on grad clipping; 3.0 is the dinov3 default (inherited
+                                      #   from ssl_default_config.yaml). Set explicitly here so it is auditable.
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 schedules:                            # schedules-v2: set peak LR directly (target paper's 2e-5)

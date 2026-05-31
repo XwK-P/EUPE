@@ -91,8 +91,18 @@ class DistillationMetaArch(nn.Module):
         # estimate streaming fp32 mean/std over `normalizer_warmup_iters` batches, then copy into the
         # already-registered FeatureNormalizer buffers (keeps them in this module's state_dict).
         n_iters = self.cfg.distill.get("normalizer_warmup_iters", 500)
-        logger.info("Estimating teacher statistics over %d iterations...", n_iters)
-        estimated = estimate_teacher_statistics(self.teachers, data_loader, n_iters=n_iters)
+        # Stage-3 pyramid: when crops.global_crops_size is a list, measure the (proxy) teacher stats
+        # across the SAME pyramid scales it is run at during training, not only its native resolution.
+        gcs = self.cfg.crops.get("global_crops_size", None) if "crops" in self.cfg else None
+        pyramid_scales = (
+            [int(s) for s in gcs]
+            if isinstance(gcs, (list, tuple)) or (hasattr(gcs, "__iter__") and not isinstance(gcs, (str, bytes, int)))
+            else None
+        )
+        logger.info("Estimating teacher statistics over %d iterations (pyramid_scales=%s)...", n_iters, pyramid_scales)
+        estimated = estimate_teacher_statistics(
+            self.teachers, data_loader, n_iters=n_iters, pyramid_scales=pyramid_scales
+        )
         for name, by_token in estimated.items():
             for token_type, normalizer in by_token.items():
                 target = self.normalizers[name][token_type]
@@ -151,9 +161,8 @@ class DistillationMetaArch(nn.Module):
         # Ported from refs/dinov3/dinov3/train/ssl_meta_arch.py:backprop_loss — divergence: bf16
         # autocast/FSDP keep the backward unscaled (no GradScaler), so this is a plain backward().
         # The cfg.optim.clip_grad clip is applied in eupe/train/train.py::do_train (matching dinov3,
-        # which clips in the loop) so it can use the FSDP-aware global-norm clip over the sharded
-        # student AND the (non-FSDP) adapter heads — clipping only self.student here would both miss
-        # the adapters and compute the wrong global norm under FSDP1.
+        # which clips in the loop) over BOTH the FSDP2-sharded student (DTensor-aware global norm) and
+        # the (non-FSDP) adapter heads — clipped per-unit, not as one joint norm (see _clip_gradients).
         loss.backward()
 
     def forward_backward(self, data, *, iteration: int = 0, **ignored) -> Dict[str, Tensor]:

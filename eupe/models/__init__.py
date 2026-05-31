@@ -28,6 +28,10 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             pos_embed_rope_shift_coords=args.pos_embed_rope_shift_coords,
             pos_embed_rope_jitter_coords=args.pos_embed_rope_jitter_coords,
             pos_embed_rope_rescale_coords=args.pos_embed_rope_rescale_coords,
+            # Thread the rope dtype so the YAML (every ViT config sets fp32) is authoritative; otherwise
+            # build_model fell back to DinoVisionTransformer's "bf16" default while the hub/eval builder
+            # (eupe/hub/backbones.py) passes "fp32" — a silent train/eval RoPE-precision mismatch.
+            pos_embed_rope_dtype=args.get("pos_embed_rope_dtype", "bf16"),
             qkv_bias=args.qkv_bias,
             layerscale_init=args.layerscale,
             norm_layer=args.norm_layer,

@@ -19,7 +19,11 @@ def test_forward_assembles_loss_dict_and_applies_gamma():
     tnorm   = {"d": {"cls": torch.randn(2, 6), "patch": torch.randn(2, 9, 6)}}
     out = loss(adapted, tnorm)
     assert "loss" in out and "d_cls" in out and "d_patch" in out
-    assert out["loss"].requires_grad is False or out["loss"].dim() == 0
+    # total is a finite 0-dim scalar equal to the single teacher's cls + (gamma-scaled) patch term.
+    # (Previously this line asserted `requires_grad is False or dim()==0`, a tautology — dim()==0 always
+    # holds for the scalar total, so it tested nothing.)
+    assert out["loss"].dim() == 0 and torch.isfinite(out["loss"])
+    torch.testing.assert_close(out["loss"], out["d_cls"] + out["d_patch"])
     # gamma path: doubling gamma doubles the patch contribution
     base = DistillationLoss(0.9, 0.1, 1.0, "d")(adapted, tnorm)
     torch.testing.assert_close(out["d_patch"], 2.0 * base["d_patch"])

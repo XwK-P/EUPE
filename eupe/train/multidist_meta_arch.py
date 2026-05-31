@@ -45,11 +45,15 @@ class MultiDistillationMetaArch(DistillationMetaArch):
         # torch.distributed.all_gather, and short-circuit when distributed is not enabled so the
         # arch is importable / single-process runnable.
         subgroup_size = distributed.get_subgroup_size()
-        if not distributed.is_enabled() or subgroup_size <= 1:
-            # Single process (or a degenerate single-rank subgroup): every rank already holds the
-            # full global batch, so just trim the padding and return it unchanged.
+        if not distributed.is_enabled():
+            # Single process: this rank already holds the full global batch, so just trim the padding.
             return x.narrow(dim=over_dim, start=0, length=global_batch_size).clone()
 
+        # Reconstruct the global batch from every world rank's local slice, trim padding, then hand this
+        # rank's subgroup its contiguous chunk. NOTE: even a degenerate 1-rank subgroup must still
+        # all-gather — each rank only holds global_batch_size // world_size rows, NOT the full batch, so
+        # the old `subgroup_size <= 1` short-circuit `narrow(0, global_batch_size)` would over-read and
+        # crash. chunk(1)[0] correctly returns the whole reconstructed batch for a 1-rank subgroup.
         gathered = distributed.gather_all_tensors(x, group=distributed.get_default_process_group())
         catted = torch.cat(gathered, dim=over_dim)
         catted = catted.narrow(dim=over_dim, start=0, length=global_batch_size)

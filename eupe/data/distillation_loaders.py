@@ -109,6 +109,7 @@ class MixedSampler:
         batch_size: int = 1,
         seed: int = 0,
         shuffle: bool = True,
+        start_iteration: int = 0,
     ):
         # Reuse eupe's rank-aware infinite index streams (one per source) so the mixed stream is
         # both infinite and correctly sharded; the per-batch Bernoulli only chooses *which* stream.
@@ -118,6 +119,10 @@ class MixedSampler:
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.shuffle = shuffle
+        # Resume: fast-forward this many batches at __iter__ time so a restarted run continues the data
+        # stream where it left off (routing generator + both per-source index streams advance together)
+        # instead of replaying from batch 0.
+        self.start_iteration = int(start_iteration)
         self._lvd_sampler = InfiniteSampler(
             sample_count=len(lvd_dataset), shuffle=shuffle, seed=seed
         )
@@ -132,6 +137,14 @@ class MixedSampler:
         generator = torch.Generator().manual_seed(self.seed)
         lvd_it = iter(self._lvd_sampler)
         imagenet_it = iter(self._imagenet_sampler)
+        # Resume fast-forward: replay the deterministic routing + index draws for the already-consumed
+        # batches WITHOUT yielding, so both per-source streams and the routing generator land exactly
+        # where the preempted run stopped.
+        for _ in range(self.start_iteration):
+            use_imagenet = torch.rand(1, generator=generator).item() < self.imagenet_prob
+            index_it = imagenet_it if use_imagenet else lvd_it
+            for _ in range(self.batch_size):
+                next(index_it)
         while True:
             use_imagenet = (
                 torch.rand(1, generator=generator).item() < self.imagenet_prob
@@ -164,7 +177,7 @@ def _default_collate(batch):
     return torch.stack(list(images), dim=0), list(sources)
 
 
-def make_distillation_data_loader(cfg) -> Iterable:
+def make_distillation_data_loader(cfg, start_iteration: int = 0) -> Iterable:
     """Build the mixed sampler + transforms + DataLoader from cfg (crops, batch_size_per_gpu, workers).
 
     `cfg.train.dataset_path` holds the two sources joined by "+": "<LVD>+<IN1k>" (each is a
@@ -208,7 +221,10 @@ def make_distillation_data_loader(cfg) -> Iterable:
     else:
         lvd_str = imagenet_str = dataset_path.strip()
         logger.warning(
-            "cfg.train.dataset_path has no '+'; using the same dataset for both LVD and IN1k sources"
+            "cfg.train.dataset_path has no '+' separator: using the SAME dataset for both the LVD and "
+            "IN1k sources. The paper's LVD-1689M + ImageNet-1k mixture (§3.4) is therefore NOT in effect "
+            "— set dataset_path='<LVD_source>+<ImageNet:...>' for a faithful run. (%s)",
+            dataset_path,
         )
 
     lvd_dataset = make_dataset(dataset_str=lvd_str, transform=transform)
@@ -225,6 +241,7 @@ def make_distillation_data_loader(cfg) -> Iterable:
         batch_size=batch_size,
         seed=seed,
         shuffle=True,
+        start_iteration=start_iteration,
     )
     routing_dataset = _MixedRoutingDataset(lvd_dataset, imagenet_dataset)
 

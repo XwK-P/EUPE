@@ -202,9 +202,13 @@ def apply_optim_scheduler(optimizer, schedulers, iteration: int) -> None:
         param_group["weight_decay"] = wd * wd_mult
 
 
-def build_data_loader(cfg):
-    """eupe.data.distillation_loaders.make_distillation_data_loader(cfg)."""
-    return make_distillation_data_loader(cfg)
+def build_data_loader(cfg, start_iteration: int = 0):
+    """eupe.data.distillation_loaders.make_distillation_data_loader(cfg).
+
+    start_iteration > 0 (resume) fast-forwards the mixed sampler so the data stream continues from
+    where the preempted run left off instead of replaying from batch 0.
+    """
+    return make_distillation_data_loader(cfg, start_iteration=start_iteration)
 
 
 def _state_dict_with_teacher_prefix(student) -> dict:
@@ -222,24 +226,97 @@ def _state_dict_with_teacher_prefix(student) -> dict:
     return teacher_sd
 
 
+def _consolidated_optimizer_state(model, optimizer):
+    """Return a full (rank-0-complete) optimizer state dict that can be reloaded on resume.
+
+    Under FSDP2 (fully_shard) the student's AdamW moments are DTensors sharded over the student's
+    process subgroup; a bare ``optimizer.state_dict()`` would persist only this rank's shard wrapped in
+    a stale-mesh DTensor. ``get_optimizer_state_dict(..., full_state_dict=True)`` consolidates them (and
+    the non-sharded adapter moments) into a full CPU state dict. It is a COLLECTIVE over the student's
+    mesh and must run on every subgroup rank. Best-effort: on any failure we return None and the
+    checkpoint omits optimizer state (resume then re-initializes AdamW moments rather than crashing).
+    """
+    if not distributed.is_enabled():
+        return optimizer.state_dict()
+    try:
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
+
+        return get_optimizer_state_dict(
+            model, optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
+    except Exception as e:  # never let checkpointing crash a training run
+        logger.warning("optimizer-state consolidation failed (%s); checkpoint will omit optimizer state", e)
+        return None
+
+
+def _restore_optimizer_state(model, optimizer, state) -> bool:
+    """Load a consolidated optimizer state dict back onto the (re-sharded) optimizer. Returns success."""
+    if state is None:
+        return False
+    if not distributed.is_enabled():
+        optimizer.load_state_dict(state)
+        return True
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
+
+    set_optimizer_state_dict(
+        model, optimizer, optim_state_dict=state, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+    )
+    return True
+
+
+def _find_latest_checkpoint(output_dir):
+    """Return (path, iteration) of the highest-numbered training_<it>.pth under <output_dir>/ckpt.
+
+    Used to resume a preempted run (paper Stage 2/3 are 390k/100k iters — effectively guaranteed to be
+    preempted on a real cluster). Returns (None, -1) when no checkpoint directory / file exists.
+    """
+    ckpt_dir = Path(output_dir, "ckpt").expanduser()
+    if not ckpt_dir.is_dir():
+        return None, -1
+    best_path, best_it = None, -1
+    for p in ckpt_dir.glob("training_*.pth"):
+        try:
+            it = int(p.stem.split("_")[-1])
+        except ValueError:
+            continue
+        if it > best_it:
+            best_path, best_it = p, it
+    return best_path, best_it
+
+
 def _save_checkpoint(cfg, model, optimizer, iteration: int) -> None:
-    """Save the trained student under 'teacher.'-prefixed keys (subgroup-main process only)."""
-    # Ported from refs/dinov3/dinov3/train/train.py:do_train checkpointing + do_test teacher save —
-    # divergence: EUPE has no dinov3 checkpointer; we save a plain consolidated dict {"teacher": ...,
-    # "optimizer": ..., "iteration": ...} where the model weights are the trained STUDENT re-keyed
-    # under 'teacher.' so eupe.models.build_model_for_eval / ProxyTeacher can reload it directly.
-    if distributed.is_enabled() and not distributed.is_subgroup_main_process():
-        return
-    ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"training_{iteration}.pth"
-    payload = {
-        "teacher": _state_dict_with_teacher_prefix(model.student),
-        "optimizer": optimizer.state_dict(),
-        "iteration": iteration,
-    }
-    torch.save(payload, ckpt_path)
-    logger.info("Saved checkpoint: %s", ckpt_path)
+    """Save the trained student (+optimizer / frozen normalizer stats / iteration) for eval, proxy
+    reuse, and resume. The student weights are re-keyed under 'teacher.' so build_model_for_eval /
+    ProxyTeacher can reload them directly.
+
+    CRITICAL ordering (was a multi-rank deadlock): consolidating the weights (DTensor.full_tensor) and
+    the optimizer state (get_optimizer_state_dict) are COLLECTIVES every subgroup rank must enter. We
+    therefore consolidate on ALL ranks FIRST, then gate only the torch.save on the subgroup-main
+    process, then barrier. The previous code returned early on non-main ranks BEFORE the full_tensor()
+    all-gather, so only rank-0 entered the collective and the run hung (NCCL timeout).
+    """
+    # Ported from refs/dinov3/dinov3/train/train.py:do_test teacher save — same "consolidate on all
+    # ranks, write on main, barrier" ordering.
+    teacher_sd = _state_dict_with_teacher_prefix(model.student)
+    optimizer_sd = _consolidated_optimizer_state(model, optimizer)
+    normalizer_sd = model.normalizers.state_dict()  # frozen per-teacher mean/std (small, plain buffers)
+
+    if not distributed.is_enabled() or distributed.is_subgroup_main_process():
+        ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"training_{iteration}.pth"
+        payload = {
+            "teacher": teacher_sd,
+            "optimizer": optimizer_sd,
+            "normalizers": normalizer_sd,
+            "iteration": iteration,
+        }
+        torch.save(payload, ckpt_path)
+        logger.info("Saved checkpoint: %s", ckpt_path)
+    # Barrier so non-main ranks do not race ahead — in particular so they do not tear down the process
+    # group (job_context teardown -> destroy_process_group) before rank-0 finishes the final write.
+    if distributed.is_enabled():
+        torch.distributed.barrier()
 
 
 def _load_student_init_checkpoint(student, checkpoint_path) -> None:
@@ -265,24 +342,29 @@ def _load_student_init_checkpoint(student, checkpoint_path) -> None:
 
 
 def _clip_gradients(model, max_norm: float) -> None:
-    """Clip grads of the (FSDP-sharded) student and the (non-FSDP) adapter heads.
+    """Clip the student grads and the (separately-held) adapter grads, each to ``max_norm``.
 
-    FSDP1 wraps the student and exposes a ``clip_grad_norm_`` that reduces the *global* sharded
-    norm; a plain ``nn.Module`` (single-process fallback) has no such method, so the free clip is
-    used there. The adapter heads live outside the FSDP unit and are always clipped with the free clip.
+    Under FSDP2 (``fully_shard``) the student params are DTensors; ``torch.nn.utils.clip_grad_norm_``
+    is DTensor-aware and reduces the correct *global* norm across the student's shards. The adapter
+    heads live outside the FSDP unit and are clipped in a SEPARATE call. This is per-unit clipping
+    (each unit bounded to ``max_norm`` independently) — it matches dinov3, which also clips each
+    student unit separately, and is NOT a single joint global norm over student+adapters.
     """
-    student = model.student
-    if hasattr(student, "clip_grad_norm_"):
-        student.clip_grad_norm_(max_norm)  # FSDP-aware global-norm clip
-    else:
-        torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm)
+    torch.nn.utils.clip_grad_norm_(model.student.parameters(), max_norm)
     adapter_grads = [p for p in model.adapters.parameters() if p.grad is not None]
     if adapter_grads:
         torch.nn.utils.clip_grad_norm_(adapter_grads, max_norm)
 
 
-def do_train(cfg, model) -> None:
-    """Main loop: init_normalizer -> for it in range(max_iter): forward_backward; schedule; checkpoint."""
+def do_train(cfg, model, *, resume_optimizer_state=None, start_iteration: int = 0,
+             skip_normalizer_init: bool = False) -> None:
+    """Main loop: init_normalizer -> for it in range(max_iter): forward_backward; schedule; checkpoint.
+
+    Resume: when resuming a preempted run, ``start_iteration`` continues the cosine LR/WD schedule and
+    the data stream where it left off, ``resume_optimizer_state`` restores the AdamW moments (best
+    effort), and ``skip_normalizer_init`` reuses the frozen normalizer stats carried in the checkpoint
+    instead of re-running the 500-iter warmup.
+    """
     # Ported from refs/dinov3/dinov3/train/train.py:do_train — divergence: no DINO/iBOT/Gram/EMA
     # bookkeeping, no MetricLogger/CombinedDataLoader. We build the optimizer over the student's
     # layer-wise-decayed param groups, run the normalizer warmup (estimate_teacher_statistics) before
@@ -317,11 +399,24 @@ def do_train(cfg, model) -> None:
 
     max_iter = _total_iters(cfg)
 
-    # Data loader (LVD-1689M + ImageNet-1k mix; pyramid collate iff crops.global_crops_size is a list).
-    data_loader = build_data_loader(cfg)
+    # Resume: restore the AdamW moments onto the freshly-built (re-sharded) optimizer. Best-effort —
+    # if the FSDP2 re-shard fails for any reason we keep training with fresh moments rather than crash.
+    if resume_optimizer_state is not None:
+        try:
+            if _restore_optimizer_state(model, optimizer, resume_optimizer_state):
+                logger.info("Restored optimizer state from checkpoint (resuming at iteration %d)", start_iteration)
+        except Exception as e:
+            logger.warning("optimizer-state restore failed (%s); continuing with fresh AdamW moments", e)
 
-    # Normalizer warmup: estimate + freeze per-teacher (cls, patch) mean/std before training.
-    model.init_normalizer(data_loader)
+    # Data loader (LVD-1689M + ImageNet-1k mix; pyramid collate iff crops.global_crops_size is a list).
+    data_loader = build_data_loader(cfg, start_iteration=start_iteration)
+
+    # Normalizer warmup: estimate + freeze per-teacher (cls, patch) mean/std before training. On resume
+    # we restore the frozen stats from the checkpoint (see main()) and skip the warmup re-estimation.
+    if skip_normalizer_init:
+        logger.info("Reusing frozen normalizer stats from checkpoint; skipping warmup estimation")
+    else:
+        model.init_normalizer(data_loader)
 
     if cfg.multidistillation.enabled:
         global_batch_size = int(cfg.multidistillation.global_batch_size)
@@ -330,8 +425,8 @@ def do_train(cfg, model) -> None:
 
     checkpoint_period = int(cfg.checkpointing.period)
 
-    logger.info("Starting distillation training for %d iterations", max_iter)
-    iteration = 0
+    logger.info("Starting distillation training for %d iterations (from iteration %d)", max_iter, start_iteration)
+    iteration = start_iteration
     data_iter = iter(data_loader)
     while iteration < max_iter:
         try:
@@ -351,8 +446,8 @@ def do_train(cfg, model) -> None:
         # Forward + backward (backprop_loss runs an unscaled loss.backward()).
         optimizer.zero_grad(set_to_none=True)
         loss_dict = model.forward_backward(data, iteration=iteration)
-        # Grad clip in the loop (matches dinov3) so it spans the FSDP-sharded student AND the
-        # separately-held adapter heads with the correct global norm.
+        # Grad clip in the loop (matches dinov3): the FSDP2-sharded student (DTensor-aware global norm)
+        # and the separately-held adapter heads are each clipped per-unit (see _clip_gradients).
         clip_grad = cfg.optim.get("clip_grad", None)
         if clip_grad:
             _clip_gradients(model, float(clip_grad))
@@ -436,6 +531,17 @@ def main(args=None) -> int:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Resume a preempted SAME-stage run from the latest checkpoint under <output_dir>/ckpt, unless
+        # --no-resume. Resume weights take precedence over the Stage-3 init checkpoint (which is only for
+        # a fresh start). 390k/100k-iter runs are effectively guaranteed to be preempted on a cluster.
+        resume_path, resume_iteration = (None, -1)
+        if not parsed.no_resume:
+            resume_path, resume_iteration = _find_latest_checkpoint(cfg.train.output_dir)
+        resume_payload = None
+        if resume_path is not None:
+            logger.info("Resuming from checkpoint %s (iteration %d)", resume_path, resume_iteration)
+            resume_payload = torch.load(resume_path, map_location="cpu")
+
         # Stage-3 finetune: an optional student-init checkpoint (the Stage-2 weights) to load BEFORE
         # FSDP sharding, so fully_shard shards the LOADED weights rather than random init. Placeholder
         # "<...>" paths are treated as unset. Students are <=~90M, so the brief unsharded
@@ -443,7 +549,23 @@ def main(args=None) -> int:
         init_ckpt = cfg.student.get("pretrained_weights", None) if "student" in cfg else None
         has_init = bool(init_ckpt) and not str(init_ckpt).startswith("<")
 
-        if has_init:
+        if resume_payload is not None:
+            # Resume: materialize + init the unsharded student, OVERWRITE its params with the resumed
+            # weights, THEN FSDP-shard the loaded weights (same ordering as the Stage-3 init path).
+            from eupe.models import extract_backbone_state_dict
+
+            if any(p.is_meta for p in model.student.parameters()):
+                model.student.to_empty(device=device)
+            if hasattr(model.student, "init_weights"):
+                model.student.init_weights()
+            resume_sd = extract_backbone_state_dict(resume_payload)
+            missing, unexpected = model.student.load_state_dict(resume_sd, strict=False)
+            if missing or unexpected:
+                logger.warning(
+                    "resume student load: %d missing / %d unexpected keys", len(missing), len(unexpected)
+                )
+            model.student = parallelize(model.student, cfg)
+        elif has_init:
             # Materialize + init the unsharded student (fills non-persistent RoPE buffers), OVERWRITE
             # its parameters with the checkpoint, THEN FSDP-shard the now-loaded weights.
             if any(p.is_meta for p in model.student.parameters()):
@@ -469,7 +591,20 @@ def main(args=None) -> int:
             model.adapters.cuda()
             model.normalizers.cuda()
 
-        do_train(cfg, model)
+        # Resume: restore the frozen normalizer stats (skip the 500-iter warmup) when the checkpoint
+        # carries them; older checkpoints without them fall back to re-estimating in do_train.
+        skip_normalizer_init = False
+        if resume_payload is not None and resume_payload.get("normalizers"):
+            model.normalizers.load_state_dict(resume_payload["normalizers"])
+            skip_normalizer_init = True
+
+        do_train(
+            cfg,
+            model,
+            resume_optimizer_state=(resume_payload.get("optimizer") if resume_payload is not None else None),
+            start_iteration=(resume_iteration + 1 if resume_payload is not None else 0),
+            skip_normalizer_init=skip_normalizer_init,
+        )
     return 0
 
 

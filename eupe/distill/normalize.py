@@ -57,12 +57,17 @@ def estimate_teacher_statistics(
     teachers: Dict[str, nn.Module],
     data_loader: Iterable,
     n_iters: int = 500,
+    pyramid_scales=None,
 ) -> Dict[str, Dict[str, "FeatureNormalizer"]]:
     """Run each frozen teacher over n_iters batches; accumulate per-coordinate mean/std for cls
     and patch tokens; return {teacher_name: {"cls": FeatureNormalizer, "patch": FeatureNormalizer}}.
 
     Paper §4.1: "crude centering ... measuring per-coordinate mean and variance during 500
     iterations before training." Run under torch.no_grad(); accumulate in fp32.
+
+    pyramid_scales (Stage 3): when given (e.g. [256, 384, 512]), the teacher is measured across those
+    scales (cycled over warmup steps) instead of only its native_resolution, so the frozen stats match
+    the resolutions the proxy is actually run at during multi-resolution training (paper §3.1).
     """
     # Ported from refs/RADIO/radio/feature_normalizer.py — divergence: RADIO solves for a PHI-S
     # rotation; here we only accumulate streaming fp32 sum/sumsq to recover a diagonal
@@ -93,20 +98,23 @@ def estimate_teacher_statistics(
 
     data_iter = iter(data_loader)
     with torch.no_grad():
-        for _ in range(n_iters):
+        for step in range(n_iters):
             try:
                 batch = next(data_iter)
             except StopIteration:
                 break
             images = _extract_images(batch)
+            # Stage-3 multi-resolution: cycle the pyramid scales across warmup steps so the frozen
+            # stats are pooled over the SAME {256,384,512} the proxy is run at during training (it
+            # samples a scale per iteration). For fixed-res stages pyramid_scales is None and each
+            # teacher is measured at its own native_resolution.
+            override = int(pyramid_scales[step % len(pyramid_scales)]) if pyramid_scales else None
             for name, teacher in teachers.items():
                 device = next((p.device for p in teacher.parameters()), images.device)
-                # Resize to the teacher's native resolution BEFORE the forward, matching the
-                # training-time DistillationMetaArch.get_teacher_outputs, so the frozen normalizer
-                # stats are measured at the SAME resolution the teacher actually sees during
-                # distillation (paper §3.3). Without this, PE teachers (native 448) would be measured
-                # at the student/crop resolution (e.g. 256) and the frozen stats would not match training.
-                teacher_images = _resize_to_native(images.to(device), teacher)
+                # Resize BEFORE the forward (bicubic, matching get_teacher_outputs) so the stats are
+                # measured at the resolution the teacher is actually run at: its native_resolution for
+                # fixed-res stages, or the cycled pyramid scale for Stage 3.
+                teacher_images = _resize_to_native(images.to(device), teacher, override_resolution=override)
                 out = teacher(teacher_images)
                 for token_type in ("cls", "patch"):
                     _accumulate(name, token_type, out[token_type])
@@ -134,13 +142,14 @@ def estimate_teacher_statistics(
     return normalizers
 
 
-def _resize_to_native(images: Tensor, teacher) -> Tensor:
-    """Bicubic-resize images to the teacher's native_resolution (no-op if absent or already there).
+def _resize_to_native(images: Tensor, teacher, override_resolution=None) -> Tensor:
+    """Bicubic-resize images to override_resolution (if given) else the teacher's native_resolution.
 
-    Mirrors DistillationMetaArch.get_teacher_outputs (bicubic, align_corners=False) so the normalizer
-    warmup measures each teacher at the same resolution training feeds it.
+    Mirrors DistillationMetaArch.get_teacher_outputs (bicubic, align_corners=False). override_resolution
+    lets the Stage-3 normalizer warmup measure the proxy at the pyramid scales it is actually run at
+    (paper §3.1/§3.3), instead of only its fixed native_resolution.
     """
-    res = getattr(teacher, "native_resolution", None)
+    res = override_resolution if override_resolution is not None else getattr(teacher, "native_resolution", None)
     if res is None or (images.shape[-1] == res and images.shape[-2] == res):
         return images
     return F.interpolate(images, size=(int(res), int(res)), mode="bicubic", align_corners=False)

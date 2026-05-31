@@ -49,6 +49,27 @@ def test_estimate_statistics_forwards_teacher_at_native_resolution():
     assert seen["hw"] == (96, 96)
 
 
+def test_estimate_statistics_cycles_pyramid_scales():
+    # Stage-3 fix: when pyramid_scales is given, the warmup must measure the teacher across those scales
+    # (cycled per step), NOT only its native_resolution — otherwise the frozen stats are measured at 256
+    # while the proxy is actually run at {256,384,512} during multi-resolution training.
+    seen = []
+
+    class ResTeacher(torch.nn.Module):
+        embed_dim = 4
+        native_resolution = 256
+
+        def forward(self, img):
+            seen.append(int(img.shape[-1]))
+            b = img.shape[0]
+            return {"cls": torch.zeros(b, 4), "patch": torch.zeros(b, 3, 4)}
+
+    loader = ([torch.randn(2, 3, 512, 512)] for _ in range(6))  # loader feeds the max pyramid crop
+    estimate_teacher_statistics({"t": ResTeacher()}, loader, n_iters=6, pyramid_scales=[256, 384, 512])
+    # 6 steps over a 3-scale pyramid cycle through 256,384,512 twice — never only native 256.
+    assert seen == [256, 384, 512, 256, 384, 512]
+
+
 def test_normalizer_estimates_per_coordinate_stats():
     # M22: normalization must be PER-COORDINATE. The existing recovery test uses i.i.d. coords, so a
     # global/scalar-stat bug would pass it. Use DISTINCT per-coordinate mean/std and assert both that

@@ -14,6 +14,7 @@ Guards:
 """
 import os
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -67,6 +68,51 @@ def test_convnext_students_build_and_emit_tokens():
         out = student.forward_features(torch.randn(1, 3, 64, 64))
         assert out["x_norm_clstoken"].shape == (1, edim)
         assert out["x_norm_patchtokens"].shape[-1] == edim
+
+
+def test_rope_dtype_is_threaded_from_cfg():
+    # build_model must thread pos_embed_rope_dtype so the YAML (every ViT config sets fp32) is
+    # authoritative; it previously fell back to DinoVisionTransformer's bf16 default while the hub/eval
+    # builder passes fp32 — a silent train/eval RoPE-precision mismatch.
+    tiny = dict(arch="vit_small", embed_dim=64, depth=1, num_heads=2, n_storage_tokens=0)
+    s_fp32, _, _ = build_model(_student_cfg("students/vitt_p16.yaml", pos_embed_rope_dtype="fp32", **tiny),
+                               img_size=32, device=None)
+    s_bf16, _, _ = build_model(_student_cfg("students/vitt_p16.yaml", pos_embed_rope_dtype="bf16", **tiny),
+                               img_size=32, device=None)
+    assert s_fp32.rope_embed.periods.dtype == torch.float32
+    assert s_bf16.rope_embed.periods.dtype == torch.bfloat16
+
+
+def test_proxy_teacher_builds_from_base_keyless_config(tmp_path):
+    # CRITICAL regression: ProxyTeacher loads the proxy YAML standalone (no ssl_default merge). Like
+    # vitg_p16.yaml, this config omits base-only keys (qkv_bias, the rope min/max/shift/jitter periods,
+    # the untie-norm flags). build_model dereferences them unconditionally, so without ProxyTeacher's
+    # default-merge this raised ConfigAttributeError and crashed every Stage-2/3 run.
+    import omegaconf
+    from omegaconf import OmegaConf
+
+    from eupe.distill.teachers import ProxyTeacher
+
+    # A tiny proxy-shaped config MISSING the base keys (mirrors vitg_p16.yaml's key set, small dims).
+    cfg = OmegaConf.create({"student": {
+        "arch": "vit_small", "embed_dim": 64, "depth": 2, "num_heads": 2, "ffn_ratio": 4.0,
+        "patch_size": 16, "n_storage_tokens": 4, "layerscale": 1.0e-05, "norm_layer": "layernormbf16",
+        "ffn_layer": "mlp", "mask_k_bias": True, "pos_embed_type": "rope", "pos_embed_rope_base": 100,
+        "pos_embed_rope_normalize_coords": "separate", "pos_embed_rope_rescale_coords": 2,
+        "pos_embed_rope_dtype": "fp32",
+    }})
+    proxy_yaml = tmp_path / "proxy_tiny.yaml"
+    OmegaConf.save(cfg, proxy_yaml)
+
+    # Sanity: the raw (un-merged) config really does crash build_model — i.e. the bug is real.
+    with pytest.raises(omegaconf.errors.ConfigAttributeError):
+        build_model(cfg.student, only_teacher=True, img_size=32)
+
+    # The fix: ProxyTeacher merges ssl_default's student block first, so it builds. Placeholder
+    # checkpoint ("<...>") skips the load and just init_weights() on CPU.
+    teacher = ProxyTeacher(config=str(proxy_yaml), checkpoint="<none>", native_resolution=32)
+    assert teacher.embed_dim == 64
+    assert teacher.native_resolution == 32
 
 
 def test_extract_backbone_state_dict_unwraps_training_payload():

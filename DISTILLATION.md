@@ -1,14 +1,16 @@
 # EUPE Multi-Stage Distillation
 
-Scaffold for reproducing EUPE's scaling-up → scaling-down distillation. See the design spec
+Reproduces EUPE's scaling-up → scaling-down distillation (arXiv:2603.22387v2). See the design spec
 (`docs/superpowers/specs/2026-05-29-multistage-multiteacher-distillation-design.md`) and the
 engineering report (`../EUPE_Distillation_Reproduction_Report.md`) for full rationale.
 
-> **Status: scaffold.** All Python bodies raise `NotImplementedError`; fill them in following the
-> docstring references before running. Configs are concrete (paths are `<PLACEHOLDERS>`).
+> **Status: implemented.** The training pipeline (`eupe/distill`, `eupe/train`, `eupe/fsdp`,
+> `eupe/data/distillation_loaders.py`) is complete and unit-tested (`tests/distill`). What remains is
+> supplying the external inputs below — datasets, teacher/proxy checkpoints — and tuning the
+> paper-silent Stage-1 recipe.
 
 ## Pipeline
-1. **Stage 1** — distill PEcore-G + PElang-G + DINOv3-H+ into a ~1.9B ViT-G proxy.
+1. **Stage 1** — distill PEcore-G + PElang-G + DINOv3-H+ into a ~1.9B ViT-G proxy (4 register tokens).
 2. **Stage 2** — distill the frozen proxy into the efficient family @256, bs 8192, lr 2e-5, 390k iters.
 3. **Stage 3** — multi-resolution finetune @{256,384,512}, bs 4096, lr 1e-5, 100k iters (init from Stage 2).
 
@@ -22,17 +24,20 @@ python -m eupe.run.submit eupe/train/train.py --nodes 32 --ngpus 8 \
 python -m eupe.run.submit eupe/train/train.py --nodes 16 --ngpus 8 --multi-distillation \
   --config-file eupe/configs/train/stage2_multidistill.yaml --output-dir <OUT>
 ```
+Runs resume automatically from the latest `<OUT>/.../ckpt/training_*.pth` (weights + optimizer +
+frozen normalizer stats + iteration); pass `--no-resume` to force a fresh start.
 
-## Fill-in checklist (each maps to one `NotImplementedError`)
-- `eupe/distill/adapters.py` — 2-layer MLP (paper §4.1)
-- `eupe/distill/normalize.py` — frozen mean/std + 500-iter estimator (paper §3.3)
-- `eupe/distill/loss.py` — cosine + 0.9·cos/0.1·smoothL1 (paper §3.2, Eq. 4-7)
-- `eupe/distill/teachers.py` — load PEcore-G/PElang-G (perception_models), DINOv3-H+ (dinov3), proxy
-- `eupe/train/{param_groups,cosine_lr_scheduler}.py` — optimizer groups + schedules (dinov3)
-- `eupe/train/{distill,multidist}_meta_arch.py` — step orchestration + subgroup broadcast (dinov3 multidist_meta_arch.py)
-- `eupe/train/train.py` — loop + checkpointing
-- `eupe/fsdp/ac_compile_parallelize.py` — FSDP(SHARD_GRAD_OP) + ac + compile (dinov3 fsdp)
-- `eupe/data/distillation_loaders.py` — LVD+IN1k mix (p=0.10) + pyramid collate
+## Prerequisites to fill in before running
+- **Teacher checkpoints** — set the `<PATH/TO/...>` fields in `eupe/configs/train/teachers/*.yaml`
+  to PEcore-G / PElang-G (facebookresearch/perception_models) and DINOv3-H+ (facebookresearch/dinov3).
+- **Datasets** — `train.dataset_path` is `<LVD_source>+<ImageNet:...>` (mixed at `distill.imagenet_prob`,
+  default 0.10, paper §3.4). LVD-1689M is proprietary; point the `LVD1689M:root=/PATH` slot at any local
+  image tree — it resolves to the label-free `ImageFolder` reader (`eupe/data/datasets/image_folder.py`).
+  For LVD-scale runs, add a WebDataset/tar adapter to `eupe/data/loaders.py::_parse_dataset_str`.
+- **Stage handoffs** — Stage 2/3 reference the Stage-1 proxy checkpoint (`distill.teachers[0].checkpoint`);
+  Stage 3 references each student's Stage-2 checkpoint (`multidistillation.students[*].pretrained_weights`).
+- **Stage-1 recipe** — the paper is silent on Stage-1 batch/LR/iterations and exact proxy dims; the values
+  in `stage1_multiteacher_proxy.yaml` are documented placeholders. Tune and gate on the Table-4 proxy scores.
 
 ## Validation milestones
 - After Stage 1: reproduce proxy numbers (report Table 4).

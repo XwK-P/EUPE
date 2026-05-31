@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, NYU
+from .datasets import ADE20K, CocoCaptions, ImageFolder, ImageNet, ImageNet22k, NYU
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 logger = logging.getLogger("eupe")
@@ -58,6 +58,11 @@ def _parse_dataset_str(dataset_str: str):
         class_ = ImageNet
         if "split" in kwargs:
             kwargs["split"] = ImageNet.Split[kwargs["split"]]
+    elif name in ("ImageFolder", "LVD1689M", "LVD"):
+        # Generic recursive image-folder reader (label-free). 'LVD1689M'/'LVD' are accepted aliases so
+        # the shipped distillation configs (<LVD1689M:root=/PATH>) resolve to it; the real LVD-1689M is
+        # proprietary, so this is the substitute source for the heterogeneous half of the §3.4 mixture.
+        class_ = ImageFolder
     elif name == "ImageNet22k":
         class_ = ImageNet22k
     elif name == "ADE20K":

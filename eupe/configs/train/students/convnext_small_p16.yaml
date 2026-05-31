@@ -1,4 +1,5 @@
 # EUPE ConvNeXt-Small student (50M).
+# depths/dims are INFORMATIONAL — build_model derives them from `arch` via convnext_sizes.
 student:
   arch: convnext_small
   depths: [3, 3, 27, 3]
