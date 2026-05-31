@@ -33,6 +33,8 @@ optim:
   optimizer: adamw
   epochs: 312                         # total iters = OFFICIAL_EPOCH_LENGTH * epochs = 1250 * 312 = 390000 (paper §4.1)
   weight_decay: 1.0e-04
+  layerwise_decay: 1.0                # single flat base LR (paper §4.1) — override ssl_default's 0.9
+  patch_embed_lr_mult: 1.0            #   (the students train from scratch, not fine-tune; no per-layer decay)
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 schedules:                            # schedules-v2: set peak LR directly (target paper's 2e-5)
