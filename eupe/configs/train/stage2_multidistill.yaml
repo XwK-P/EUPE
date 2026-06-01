@@ -13,10 +13,14 @@ multidistillation:                    # rank-partition launcher (eupe/configs/co
   # (setup_multidistillation asserts global_batch_size % span == 0 and sets
   # batch_size_per_gpu = global_batch_size // world_size). 8192 % {16,32} == 0 and 8192 % 128 == 0.
   # This is an example 128-GPU (16-node x 8) layout — scale spans to your cluster, keeping divisibility.
-  # NOTE: 8192 is the AGGREGATE co-distillation batch shared across all students via one proxy forward.
-  # Each student's EFFECTIVE per-step batch is (its rank span) x batch_size_per_gpu, e.g. ViT-T (span 16)
-  # sees 16x64=1024 and ViT-B (span 32) sees 2048. To train a student at the literal 8192, give it a
-  # 128-rank span (run it alone) or scale its LR/iters to its actual per-student batch.
+  # NOTE: 8192 is the GLOBAL co-distillation batch and EVERY student trains on ALL of it each step (this
+  # mirrors dinov3 multidist). The proxy runs ONCE per iteration (each rank forwards its
+  # global_batch_size // world_size = 64 local images); broadcast_to_subgroups then all-gathers the full
+  # 8192-image batch and re-partitions it across each student's subgroup (multidist_meta_arch.py). So the
+  # EFFECTIVE per-step batch is 8192 for every student, split as global_batch_size // span imgs/rank:
+  # ViT-T (span 16) -> 512/rank, ViT-B (span 32) -> 256/rank. Larger students get larger spans precisely
+  # so their per-rank (memory) load shrinks; all students therefore share the single LR/iters schedule
+  # below (identical 8192 effective batch each), and the spans need only divide global_batch_size.
   students:
     - {name: vitt,           config_path: eupe/configs/train/students/vitt_p16.yaml,           ranks_range: [0, 16]}
     - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 32]}
