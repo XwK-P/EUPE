@@ -1,0 +1,5 @@
+docstr-coverage
+mypy
+pylint
+pytest
+ruff

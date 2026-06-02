@@ -146,8 +146,22 @@ class CheckpointableSubmitter:
 
         job_env = submitit.JobEnvironment()
         self.output_dir = str(self.output_dir).replace("%j", str(job_env.job_id))
-        # if "--output-dir" not in self.args:
-        #     self.args.insert(0, f"--output-dir={self.output_dir}")
+        # Forward the resolved output dir to the launched script. The wrapper's own parser consumes
+        # `--output-dir` (it is a submitit arg), so without this the script never receives it and falls
+        # back to its default (train.py -> ./local_eupe). One `--output-dir=<dir>` flag serves both
+        # entry points: train.py reads it via argparse, and the eval cli_parser accepts the
+        # `--output-dir=` form (see eupe/eval/helpers.py::cli_parser). Inserted at the FRONT so it lands
+        # before any trailing OmegaConf `key=value` overrides, which train.py captures with nargs=REMAINDER.
+        # Skipped when the script was already handed an output dir as an opt, to avoid a duplicate.
+        already_has_output_dir = any(
+            a == "--output-dir"
+            or a.startswith("--output-dir=")
+            or a.startswith("output_dir=")
+            or a.startswith("train.output_dir=")
+            for a in self.args
+        )
+        if not already_has_output_dir:
+            self.args.insert(0, f"--output-dir={self.output_dir}")
 
         # Setup logging with exact same arguments as in fairvit/run/init.py
         # to use lru_cache memoization and avoid setting up the logger twice
