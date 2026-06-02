@@ -32,9 +32,12 @@ pylint eupe     # only similarities + FIXME/XXX/TODO notes are enabled
 
 ### Training (launched via the submitit wrapper `eupe.run.submit`)
 
-`python -m eupe.run.submit <script.py> --nodes N --ngpus 8 [submitit opts] -- <script opts>`
-submits a SLURM job that runs `<script>.main(script_args)`. The training entry point is
-`eupe/train/train.py`:
+`python -m eupe.run.submit <script.py> [submitit opts] <script opts>` submits a SLURM job that runs
+`<script>.main(script_args)`. The wrapper parses its own args (`--nodes`, `--ngpus`, `--output-dir`,
+`--timeout`, …) and forwards everything it doesn't recognize (`--config-file`, `--multi-distillation`,
+trailing `key=value` overrides) to the script; `--output-dir` is consumed by the wrapper but also
+re-forwarded to the script. Do **not** insert a `--` separator — it gets passed through and is
+swallowed by `train.py`'s `nargs=REMAINDER` opts. The training entry point is `eupe/train/train.py`:
 
 ```bash
 # Stage 1 — 3 foundation teachers -> ViT-G proxy (single student)
