@@ -24,8 +24,8 @@ python -m eupe.run.submit eupe/train/train.py --nodes 32 --ngpus 8 \
 python -m eupe.run.submit eupe/train/train.py --nodes 16 --ngpus 8 --multi-distillation \
   --config-file eupe/configs/train/stage2_multidistill.yaml --output-dir <OUT>
 ```
-Runs resume automatically from the latest `<OUT>/.../ckpt/training_*.pth` (weights + optimizer +
-frozen normalizer stats + iteration); pass `--no-resume` to force a fresh start.
+Runs resume automatically from the latest `<OUT>/.../ckpt/training_*.pth` (student weights + adapter
+heads + optimizer + frozen normalizer stats + iteration); pass `--no-resume` to force a fresh start.
 
 ## Prerequisites to fill in before running
 - **Teacher checkpoints** — set the `<PATH/TO/...>` fields in `eupe/configs/train/teachers/*.yaml`
