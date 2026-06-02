@@ -1,0 +1,48 @@
+# Stage 3: proxy -> family, multi-resolution pyramid {256,384,512}, short schedule.
+# Students init from Stage-2 checkpoints (set student.pretrained_weights per student config).
+MODEL:
+  META_ARCHITECTURE: MultiDistillationMetaArch
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+multidistillation:
+  enabled: true
+  global_batch_size: 4096
+  # Same divisible 128-GPU layout as Stage 2 (spans + total divide global_batch_size 4096).
+  # `pretrained_weights` per student is the Stage-2 checkpoint to FINETUNE from (paper §3.1: Stage 3
+  # initializes the student from Stage 2). setup_multidistillation threads it into student.pretrained_weights
+  # and train.py loads it into the student before FSDP; paths point at each student's Stage-2 output.
+  students:
+    - {name: vitt,           config_path: eupe/configs/train/students/vitt_p16.yaml,           ranks_range: [0, 16],   pretrained_weights: <STAGE2_OUT>/vitt/ckpt/training_389999.pth}
+    - {name: vits,           config_path: eupe/configs/train/students/vits_p16.yaml,           ranks_range: [16, 32],  pretrained_weights: <STAGE2_OUT>/vits/ckpt/training_389999.pth}
+    - {name: vitb,           config_path: eupe/configs/train/students/vitb_p16.yaml,           ranks_range: [32, 64],  pretrained_weights: <STAGE2_OUT>/vitb/ckpt/training_389999.pth}
+    - {name: convnext_tiny,  config_path: eupe/configs/train/students/convnext_tiny_p16.yaml,  ranks_range: [64, 80],  pretrained_weights: <STAGE2_OUT>/convnext_tiny/ckpt/training_389999.pth}
+    - {name: convnext_small, config_path: eupe/configs/train/students/convnext_small_p16.yaml, ranks_range: [80, 96],  pretrained_weights: <STAGE2_OUT>/convnext_small/ckpt/training_389999.pth}
+    - {name: convnext_base,  config_path: eupe/configs/train/students/convnext_base_p16.yaml,  ranks_range: [96, 128], pretrained_weights: <STAGE2_OUT>/convnext_base/ckpt/training_389999.pth}
+distill:
+  teachers:
+    - {name: proxy, config: eupe/configs/train/proxy/vitg_p16.yaml, checkpoint: <STAGE1_PROXY_CKPT.pth>}
+  adapter_hidden_dim: 3072
+  normalizer_warmup_iters: 500
+  loss: {alpha: 0.9, beta: 0.1, dinov3_patch_gamma: 1.0}
+  imagenet_prob: 0.10                  # P(homogeneous ImageNet-1k batch) vs LVD (paper §3.4)
+crops:
+  global_crops_size: [256, 384, 512]  # pyramid; teacher & student sample independently
+  teacher_to_student_resolution_scale: 1.0
+optim:
+  optimizer: adamw
+  epochs: 80                          # total iters = OFFICIAL_EPOCH_LENGTH * epochs = 1250 * 80 = 100000 (paper §4.1)
+  weight_decay: 1.0e-04
+  layerwise_decay: 1.0                # single flat base LR (paper §4.1) — override ssl_default's 0.9
+  patch_embed_lr_mult: 1.0            #   (Stage-3 finetune of the small students; no per-layer decay)
+  clip_grad: 3.0                      # paper is SILENT on grad clipping; 3.0 is the inherited dinov3 default.
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+schedules:
+  lr: {start: 0.0, peak: 1.0e-05, end: 0.0, warmup_epochs: 0, cosine: true}
+train:
+  dataset_path: <LVD1689M:root=/PATH>+<ImageNet:split=TRAIN:root=/PATH:extra=/PATH>   # '+'-split: LVD + IN1k
+  OFFICIAL_EPOCH_LENGTH: 1250         # x optim.epochs(80) = 100000 iters (paper §4.1)
+  compile: true
+  checkpointing: true

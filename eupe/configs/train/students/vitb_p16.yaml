@@ -1,0 +1,19 @@
+# EUPE ViT-B/16 student (86M). Matches eupe/hub/backbones.py::eupe_vitb16.
+student:
+  arch: vit_base
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  patch_size: 16
+  n_storage_tokens: 4
+  layerscale: 1.0e-05
+  norm_layer: layernormbf16
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  mask_k_bias: true
+  drop_path_rate: 0.0
+  pos_embed_type: rope
+  pos_embed_rope_base: 100
+  pos_embed_rope_normalize_coords: separate
+  pos_embed_rope_rescale_coords: 2
+  pos_embed_rope_dtype: fp32

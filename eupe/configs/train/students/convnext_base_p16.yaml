@@ -1,0 +1,10 @@
+# EUPE ConvNeXt-Base student (89M).
+# NOTE: depths/dims are INFORMATIONAL — build_model derives them from `arch` via convnext_sizes
+# (eupe/models/convnext.py); only arch, drop_path_rate, layer_scale_init_value (+ optional patch_size)
+# are consumed. They are kept here to document the size; edit convnext_sizes to actually change them.
+student:
+  arch: convnext_base
+  depths: [3, 3, 27, 3]
+  dims: [128, 256, 512, 1024]
+  drop_path_rate: 0.0
+  layer_scale_init_value: 1.0e-06

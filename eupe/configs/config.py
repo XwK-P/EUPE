@@ -148,12 +148,24 @@ def setup_multidistillation(args: EupeSetupArgs):
     name = student.name
     config_path = student.config_path
     n_gpus = student.ranks_range[1] - student.ranks_range[0]
-    assert global_batch_size % n_gpus == 0
     total_n_gpus = distributed.get_world_size()
+    assert global_batch_size % n_gpus == 0, (
+        f"multidistillation.global_batch_size ({global_batch_size}) must be divisible by student "
+        f"{name!r}'s rank span ({n_gpus}); adjust ranks_range or global_batch_size."
+    )
+    assert global_batch_size % total_n_gpus == 0, (
+        f"multidistillation.global_batch_size ({global_batch_size}) must be divisible by the total "
+        f"world size ({total_n_gpus}) so batch_size_per_gpu is exact (no silent truncation)."
+    )
 
     args.output_dir = os.path.join(base_output_dir, name)
     args.opts += [f"train.output_dir={args.output_dir}"]
     args.opts += [f"train.batch_size_per_gpu={global_batch_size // total_n_gpus}"]
+    # Stage 3: finetune from the Stage-2 checkpoint. Thread the per-student init weights into
+    # student.pretrained_weights so train.py loads them into the student before FSDP (paper §3.1).
+    init_ckpt = student.get("pretrained_weights", None)
+    if init_ckpt is not None:
+        args.opts += [f"student.pretrained_weights={init_ckpt}"]
     args.config_file = os.path.abspath(config_path)
     default_cfg = get_default_config()
     cfg = OmegaConf.load(args.config_file)

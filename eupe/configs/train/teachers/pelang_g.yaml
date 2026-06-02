@@ -1,0 +1,7 @@
+# PElang-G teacher (VLM / OCR). Load via perception_models. Crucial for OCR + general VLM.
+name: pelang_g
+loader: PELangTeacher
+checkpoint: <PATH/TO/PElang-G.pt>   # facebookresearch/perception_models
+native_resolution: 448
+embed_dim: 1536                      # INFORMATIONAL for PE teachers — the loader reads model.width (1536); not consumed.
+pe_config: PE-Lang-G14-448          # perception_models key (pool_type=none -> cls is mean-pooled; see teachers.py)
