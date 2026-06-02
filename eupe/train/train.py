@@ -300,6 +300,12 @@ def _save_checkpoint(cfg, model, optimizer, iteration: int) -> None:
     teacher_sd = _state_dict_with_teacher_prefix(model.student)
     optimizer_sd = _consolidated_optimizer_state(model, optimizer)
     normalizer_sd = model.normalizers.state_dict()  # frozen per-teacher mean/std (small, plain buffers)
+    # Trainable adapter heads (paper §4.1). They live OUTSIDE the FSDP student, so their params are
+    # plain (non-sharded, replicated) tensors — no full_tensor() collective needed, same as the
+    # normalizers. They MUST be persisted: optimizer_sd already carries the adapters' AdamW moments,
+    # so omitting the weights would resume a preempted run with randomly re-initialized heads driven
+    # by moments tuned for the trained heads (mismatched projection -> corrupted gradients).
+    adapter_sd = model.adapters.state_dict()
 
     if not distributed.is_enabled() or distributed.is_subgroup_main_process():
         ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
@@ -309,6 +315,7 @@ def _save_checkpoint(cfg, model, optimizer, iteration: int) -> None:
             "teacher": teacher_sd,
             "optimizer": optimizer_sd,
             "normalizers": normalizer_sd,
+            "adapters": adapter_sd,
             "iteration": iteration,
         }
         torch.save(payload, ckpt_path)
@@ -597,6 +604,19 @@ def main(args=None) -> int:
         if resume_payload is not None and resume_payload.get("normalizers"):
             model.normalizers.load_state_dict(resume_payload["normalizers"])
             skip_normalizer_init = True
+
+        # Resume: restore the jointly-trained adapter heads so they match the resumed student and the
+        # AdamW moments carried in resume_payload["optimizer"]. In-place load preserves the Parameter
+        # identities the optimizer groups (built later in do_train) will reference. Older checkpoints
+        # without the key fall back to the fresh constructor init (matching pre-fix behavior).
+        if resume_payload is not None and resume_payload.get("adapters"):
+            missing, unexpected = model.adapters.load_state_dict(resume_payload["adapters"], strict=False)
+            if missing or unexpected:
+                logger.warning(
+                    "resume adapter load: %d missing / %d unexpected keys", len(missing), len(unexpected)
+                )
+            else:
+                logger.info("Restored adapter heads from checkpoint")
 
         do_train(
             cfg,
