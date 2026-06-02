@@ -44,6 +44,20 @@ def test_vit_tiny_honors_explicit_dims():
     assert student.num_heads == 3
 
 
+def test_named_factory_used_when_only_ffn_ratio_present():
+    # P1 regression: ssl_default supplies ffn_ratio (4.0) but leaves the structural dims to the named
+    # factory. ffn_ratio alone must NOT trigger the explicit-dims constructor, else the factory's dims
+    # (here vit_small's 384/12/6) are silently replaced by DinoVisionTransformer's 768/12/12 defaults.
+    default = OmegaConf.load(_DEFAULT_CFG).student
+    cfg = OmegaConf.merge(default, OmegaConf.create({"arch": "vit_small", "n_storage_tokens": 0}))
+    for k in ("embed_dim", "depth", "num_heads"):  # precondition: NO structural dims in the cfg
+        assert cfg.get(k) is None
+    assert cfg.get("ffn_ratio") is not None  # the landmine: the default always supplies ffn_ratio
+    student, _teacher, dim = build_model(cfg, img_size=64, device=None)
+    assert dim == 384 and student.embed_dim == 384  # vit_small factory dims, NOT the 768 DinoViT default
+    assert student.n_blocks == 12 and student.num_heads == 6
+
+
 def test_ffn_ratio_is_threaded():
     # H8 mechanism: build_model must thread ffn_ratio (so the proxy can be widened toward ~1.9B).
     tiny = dict(arch="vit_small", embed_dim=64, depth=1, num_heads=2, n_storage_tokens=0)

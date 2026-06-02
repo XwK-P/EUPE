@@ -48,18 +48,29 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
         # tuned ~1.9B proxy are built as configured instead of silently falling back to the named
         # factory's hardcoded dims. The vit_* factories hardcode embed_dim/depth/num_heads/ffn_ratio
         # and pass **kwargs through, so passing those via kwargs to a factory raises a duplicate-
-        # keyword error; when explicit dims are present we construct DinoVisionTransformer directly.
+        # keyword error; when explicit STRUCTURAL dims are present we construct DinoVisionTransformer
+        # directly.
+        #
+        # Detection keys off the STRUCTURAL dims (embed_dim/depth/num_heads) ONLY — never ffn_ratio.
+        # ssl_default_config.yaml always supplies ffn_ratio (4.0) while leaving the structural dims to
+        # the named factory (e.g. `arch: vit_large` with no embed_dim/depth/num_heads), so keying off
+        # ffn_ratio would make `explicit` non-empty and silently build DinoVisionTransformer's
+        # 768/12/12 defaults instead of vit_large's 1024/24/16. We still THREAD ffn_ratio into the
+        # direct-construction path, so structural-dims configs that also retune the FFN (e.g. the
+        # ~1.9B proxy's ffn_ratio=8.0) get it.
+        structural = ("embed_dim", "depth", "num_heads")
         explicit = {
             k: args[k]
-            for k in ("embed_dim", "depth", "num_heads", "ffn_ratio")
+            for k in structural + ("ffn_ratio",)
             if k in args and args.get(k) is not None
         }
+        use_explicit = any(k in explicit for k in structural)
 
         def _make_vit(extra=None):
             kw = dict(vit_kwargs)
             if extra:
                 kw.update(extra)
-            if explicit:
+            if use_explicit:
                 kw.update(explicit)
                 return vits.DinoVisionTransformer(**kw)
             return vits.__dict__[args.arch](**kw)

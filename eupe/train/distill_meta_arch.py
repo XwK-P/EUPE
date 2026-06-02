@@ -205,9 +205,16 @@ class DistillationMetaArch(nn.Module):
             return data[0]
         raise TypeError(f"forward_backward: unsupported batch type {type(data)!r}")
 
-    def train(self):
-        """Keep frozen teachers in eval() even when the meta-arch is set to train()."""
-        # Ported from refs/dinov3/dinov3/train/ssl_meta_arch.py:train — keep targets deterministic.
-        super().train()
+    def train(self, mode: bool = True):
+        """Set the meta-arch's train/eval mode, keeping the frozen teachers in eval() regardless.
+
+        Must accept ``mode`` to honor the ``nn.Module.train(mode)`` contract: ``model.eval()`` is
+        implemented by PyTorch as ``self.train(False)``, so a no-arg override crashes every eval/
+        validation/export path with a TypeError. We forward ``mode`` to ``super().train`` and then
+        force the teachers back to eval so the distillation targets stay deterministic.
+        """
+        # Ported from refs/dinov3/dinov3/train/ssl_meta_arch.py:train — keep targets deterministic;
+        # diverges from the ref's no-arg signature to respect the Module.train(mode) contract.
+        super().train(mode)
         self.teachers.eval()
         return self
